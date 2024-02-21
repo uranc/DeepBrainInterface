@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.9.34607.119
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DeepBrainInterface", "DeepBrainInterface\DeepBrainInterface.csproj", "{BDAC7B83-42B9-4777-804B-6AB166FC3949}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BDAC7B83-42B9-4777-804B-6AB166FC3949}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BDAC7B83-42B9-4777-804B-6AB166FC3949}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BDAC7B83-42B9-4777-804B-6AB166FC3949}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BDAC7B83-42B9-4777-804B-6AB166FC3949}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {47520AD1-17D5-42CC-AE5F-C9B00037CF20}
+	EndGlobalSection
+EndGlobal
