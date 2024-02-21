@@ -2,13 +2,13 @@
 
   <PropertyGroup>
     <Title>DeepBrainInterface</Title>
-    <Description>A package for the Bonsai visual programming language.</Description>
-    <Authors></Authors>
+    <Description>A package for the Real-Time Closed Loop Stimulation.</Description>
+    <Authors>Cem Uran, Carmen Gasco Galvez</Authors>
     <Copyright>Copyright ©  2024</Copyright>
     <GeneratePackageOnBuild Condition="'$(Configuration)'=='Release'">true</GeneratePackageOnBuild>
-    <PackageProjectUrl></PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/uranc/DeepBrainInterface.git</PackageProjectUrl>
     <PackageLicenseExpression></PackageLicenseExpression>
-    <PackageIcon></PackageIcon>
+    <PackageIcon>C:\Users\ESIadmin\Documents\DeepBrainInterface\DeepBrainInterface\DeepBrainInterface\dbi2.png</PackageIcon>
     <PackageOutputPath></PackageOutputPath>
     <PackageTags>Bonsai Rx DeepBrainInterface</PackageTags>
     <TargetFramework>net472</TargetFramework>

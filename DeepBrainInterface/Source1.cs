@@ -12,9 +12,14 @@ namespace DeepBrainInterface
     [WorkflowElementCategory(ElementCategory.Source)]
     public class Source1
     {
-        public IObservable<int> Generate()
+        [Range(0.1, 2)]
+        [Editor(DesignTypes.SliderEditor, DesignTypes.UITypeEditor)]
+        public double PeriodSeconds { get; set; } = 0.5;
+        public IObservable<double> Generate()
         {
-            return Observable.Return(0);
+            return Observable.Timer(dueTime: TimeSpan.Zero,
+                period: TimeSpan.FromSeconds(PeriodSeconds))
+                .Select(counter => Math.Sin(counter));
         }
     }
 }
