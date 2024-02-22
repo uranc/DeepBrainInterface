@@ -14,7 +14,7 @@ namespace DeepBrainInterface
     {
         [Range(0.1, 2)]
         [Editor(DesignTypes.SliderEditor, DesignTypes.UITypeEditor)]
-        public double PeriodSeconds { get; set; } = 0.5;
+        public double PeriodSeconds { get; set; } = 1/1250;
         public IObservable<double> Generate()
         {
             return Observable.Timer(dueTime: TimeSpan.Zero,
