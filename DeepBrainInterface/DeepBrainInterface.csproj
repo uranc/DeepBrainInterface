@@ -14,6 +14,9 @@
     <TargetFramework>net472</TargetFramework>
     <Features>strict</Features>
     <Version>0.2.0</Version>
+    <Optimize>true</Optimize>
+    <DebugType>pdbonly</DebugType>
+    <DebugSymbols>true</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,6 +29,9 @@
 
   <ItemGroup>
     <Compile Update="ConvertNDArrayToMat.cs">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Update="RunningZScore.cs">
       <SubType>Code</SubType>
     </Compile>
   </ItemGroup>

@@ -10,32 +10,41 @@ using Tensorflow.NumPy;
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Detect with CNN")]
+    [Description("Detect ripples using CNN model")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetector
     {
+        private static Session session;
+        private static Graph graph;
+        private static Operation inputOperation;
+        private static Operation outputOperation;
+
+        [Description("Number of timesteps for the input")]
         public Int64 nTimesteps { get; set; } = 50;
+
+        [Description("Path to the TensorFlow model file")]
+        public string ModelPath { get; set; } = "default_model.pb";
+
+        private void InitializeModel()
+        {
+            if (session == null)
+            {
+                graph = Detector.Generate(ModelPath);
+                session = new Session(graph);
+                inputOperation = graph.OperationByName("x");
+                outputOperation = graph.OperationByName("Identity");
+            }
+        }
 
         public IObservable<float[]> Process(IObservable<NDArray> source)
         {
-            // Load the TensorFlow graph 
-            var graph = Detector.Generate();
-            var sess = new Session(graph);
-            var inputOperation = graph.OperationByName("x");
-            var outputOperation = graph.OperationByName("Identity");
-
+            InitializeModel();
+            
             return source.SelectMany(input =>
             {
-                // Run inference on the input NDArray
-                var results = sess.run(outputOperation.outputs[0],
+                var results = session.run(outputOperation.outputs[0],
                     new FeedItem(inputOperation.outputs[0], input.reshape((1, nTimesteps, 8))));
-
-                // Squeeze and reshape the results
-                results = np.squeeze(results);
-
-                // Extract float array from NDArray
-                var resultData = results.ToArray<float>();
-                return Observable.Return(resultData);
+                return Observable.Return(np.squeeze(results).ToArray<float>());
             });
         }
     }

@@ -3,39 +3,56 @@ using System;
 using System.ComponentModel;
 using OpenCV.Net;
 using System.Reactive.Linq;
+using Tensorflow;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Converts a float array into an OpenCV.Net Mat.")]
+    [Description("Converts NDArray to OpenCV Mat format with safety checks.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class ConvertNDArrayToMat
+    public class ConvertNDArrayToMat : Transform<NDArray, Mat>
     {
-        public int Rows { get; set; } = 50;  // Number of rows in the Mat
-        public int Cols { get; set; } = 8;   // Number of columns in the Mat
-
-        public IObservable<Mat> Process(IObservable<float[]> source)
+        public override IObservable<Mat> Process(IObservable<NDArray> source)
         {
             return source.Select(input =>
             {
-                if (input.Length != Rows * Cols)
+                if (input == null)
+                    throw new ArgumentNullException(nameof(input), "Input NDArray cannot be null");
+
+                // Ensure input is in correct format
+                if (input.dtype != TF_DataType.TF_FLOAT)
                 {
-                    throw new ArgumentException($"Input array must have exactly {Rows * Cols} elements.");
+                    input = input.cast(TF_DataType.TF_FLOAT);
                 }
 
-                // Pin the array in memory
-                var handle = System.Runtime.InteropServices.GCHandle.Alloc(input, System.Runtime.InteropServices.GCHandleType.Pinned);
+                var shape = input.shape;
+                if (shape.Length < 2)
+                    throw new ArgumentException("Input NDArray must have at least 2 dimensions");
 
+                // Get data with bounds checking
+                float[] data;
                 try
                 {
-                    // Create Mat directly from the pinned pointer
-                    var mat = new Mat(Rows, Cols, Depth.F32, 1, handle.AddrOfPinnedObject());
-                    return mat;
+                    data = input.ToArray<float>();
                 }
-                finally
+                catch (Exception ex)
                 {
-                    // Release the pinned handle
-                    handle.Free();
+                    throw new InvalidOperationException("Failed to convert NDArray to float array", ex);
+                }
+
+                // Validate and clamp values
+                for (int i = 0; i < data.Length; i++)
+                {
+                    if (float.IsNaN(data[i]) || float.IsInfinity(data[i]))
+                        data[i] = 0f;
+                    data[i] = Math.Max(0f, Math.Min(1f, data[i])); // Clamp between 0 and 1
+                }
+
+                // Create Mat with proper dimensions
+                using (var mat = new Mat(shape[0], shape[1], Depth.F32, 1))
+                {
+                    Marshal.Copy(data, 0, mat.Data, data.Length);
+                    return mat;
                 }
             });
         }
