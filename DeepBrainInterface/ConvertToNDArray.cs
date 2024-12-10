@@ -1,11 +1,10 @@
 ﻿using Bonsai;
+using OpenCV.Net;
 using System;
 using System.ComponentModel;
-using static Tensorflow.Binding;
-using OpenCV.Net;
-using Tensorflow.NumPy;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using Tensorflow.NumPy;
 
 namespace DeepBrainInterface
 {
