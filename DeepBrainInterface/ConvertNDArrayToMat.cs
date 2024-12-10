@@ -4,56 +4,38 @@ using System.ComponentModel;
 using OpenCV.Net;
 using System.Reactive.Linq;
 using Tensorflow;
+using System.Runtime.InteropServices;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Converts NDArray to OpenCV Mat format with safety checks.")]
+    [Description("Converts NDArray to OpenCV Mat format with optimized performance.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class ConvertNDArrayToMat : Transform<NDArray, Mat>
+    public unsafe class ConvertNDArrayToMat : Transform<NDArray, Mat>
     {
         public override IObservable<Mat> Process(IObservable<NDArray> source)
         {
             return source.Select(input =>
             {
-                if (input == null)
-                    throw new ArgumentNullException(nameof(input), "Input NDArray cannot be null");
-
-                // Ensure input is in correct format
-                if (input.dtype != TF_DataType.TF_FLOAT)
-                {
-                    input = input.cast(TF_DataType.TF_FLOAT);
-                }
+                if (input == null || input.shape.Length < 2)
+                    throw new ArgumentException("Invalid input array");
 
                 var shape = input.shape;
-                if (shape.Length < 2)
-                    throw new ArgumentException("Input NDArray must have at least 2 dimensions");
+                var mat = new Mat(shape[0], shape[1], Depth.F32, 1);
+                
+                // Get direct pointer to NDArray data
+                IntPtr srcPtr = input.BufferToArray();
+                if (srcPtr == IntPtr.Zero)
+                    throw new InvalidOperationException("Failed to get array buffer");
 
-                // Get data with bounds checking
-                float[] data;
-                try
-                {
-                    data = input.ToArray<float>();
-                }
-                catch (Exception ex)
-                {
-                    throw new InvalidOperationException("Failed to convert NDArray to float array", ex);
-                }
+                // Direct memory copy
+                Buffer.MemoryCopy(
+                    srcPtr.ToPointer(),
+                    mat.Data.ToPointer(),
+                    mat.Step * mat.Rows,
+                    shape[0] * shape[1] * sizeof(float));
 
-                // Validate and clamp values
-                for (int i = 0; i < data.Length; i++)
-                {
-                    if (float.IsNaN(data[i]) || float.IsInfinity(data[i]))
-                        data[i] = 0f;
-                    data[i] = Math.Max(0f, Math.Min(1f, data[i])); // Clamp between 0 and 1
-                }
-
-                // Create Mat with proper dimensions
-                using (var mat = new Mat(shape[0], shape[1], Depth.F32, 1))
-                {
-                    Marshal.Copy(data, 0, mat.Data, data.Length);
-                    return mat;
-                }
+                return mat;
             });
         }
     }
