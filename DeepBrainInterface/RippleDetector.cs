@@ -15,7 +15,7 @@ namespace DeepBrainInterface
     public class RippleDetector
     {
         private static Session session;
-        private static Graph graph;
+        private static Tensorflow.Graph graph;
         private static Operation inputOperation;
         private static Operation outputOperation;
 
@@ -29,7 +29,9 @@ namespace DeepBrainInterface
         {
             if (session == null)
             {
-                graph = Detector.Generate(ModelPath);
+                //graph = Detector.Generate(ModelPath);
+                var graph = new Tensorflow.Graph().as_default();
+                graph.Import(ModelPath);
                 session = new Session(graph);
                 inputOperation = graph.OperationByName("x");
                 outputOperation = graph.OperationByName("Identity");
