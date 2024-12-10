@@ -16,7 +16,6 @@ namespace DeepBrainInterface
     {
         public Int64 nTimesteps { get; set; } = 50;
 
-        //public IObservable<Mat> Process(IObservable<NDArray> source)
         public IObservable<float[]> Process(IObservable<NDArray> source)
         {
             // Load the TensorFlow graph
@@ -33,7 +32,6 @@ namespace DeepBrainInterface
 
                 // Squeeze and reshape the results
                 results = np.squeeze(results);
-                //results = results.reshape((nTimesteps, 9));
 
                 // Extract float array from NDArray
                 var resultData = results.ToArray<float>();
