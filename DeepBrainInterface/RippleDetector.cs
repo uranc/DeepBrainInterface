@@ -18,7 +18,7 @@ namespace DeepBrainInterface
 
         public IObservable<float[]> Process(IObservable<NDArray> source)
         {
-            // Load the TensorFlow graph
+            // Load the TensorFlow graph 
             var graph = Detector.Generate();
             var sess = new Session(graph);
             var inputOperation = graph.OperationByName("x");
