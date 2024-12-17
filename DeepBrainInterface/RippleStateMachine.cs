@@ -1,9 +1,9 @@
 using Bonsai;
 using System;
-using System.ComponentModel;
-using System.Reactive.Linq;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
+using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {
@@ -69,7 +69,7 @@ namespace DeepBrainInterface
         {
             var thresholdStrings = DetectionThresholds.Split(',');
             thresholds = new float[channels];
-            
+
             // Fill thresholds array, repeating last value if needed
             for (int i = 0; i < channels; i++)
             {
@@ -152,13 +152,17 @@ namespace DeepBrainInterface
 
         private int GetCurrentSkip()
         {
-            return currentState switch
+            switch (currentState)
             {
-                RippleState.NoRipple => NoRippleSkip,
-                RippleState.PossibleRipple => PossibleRippleSkip,
-                RippleState.DefiniteRipple => DefiniteRippleSkip,
-                _ => NoRippleSkip
-            };
+                case RippleState.NoRipple:
+                    return NoRippleSkip;
+                case RippleState.PossibleRipple:
+                    return PossibleRippleSkip;
+                case RippleState.DefiniteRipple:
+                    return DefiniteRippleSkip;
+                default:
+                    return NoRippleSkip;
+            }
         }
     }
 
