@@ -52,15 +52,15 @@ namespace DeepBrainInterface
                     CV.ScaleAdd(delta, new Scalar(scale), runningMean, runningMean);
 
                     var delta2 = new Mat(1, Channels, input.Depth, 1);
-                    CV.Sub(currentRow, runningMean, delta2);
-                    CV.Mul(delta, delta2, delta2);
-                    CV.ScaleAdd(delta2, new Scalar(scale), runningM2, runningM2);
+                    CV.Mul(delta, delta, delta2);
+                    var m2Scale = (count - 1.0) / count;
+                    CV.ScaleAdd(runningM2, new Scalar(m2Scale), delta2, runningM2);
 
                     // Compute z-score for current timepoint
                     if (count > 1)
                     {
                         var std = new Mat(1, Channels, input.Depth, 1);
-                        CV.ConvertScale(runningM2, std, 1.0 / count);
+                        CV.Copy(runningM2, std);
                         CV.Pow(std, std, 0.5);
 
                         var zScore = new Mat(1, Channels, input.Depth, 1);
