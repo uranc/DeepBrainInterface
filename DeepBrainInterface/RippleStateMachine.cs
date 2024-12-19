@@ -1,9 +1,9 @@
 using Bonsai;
 using System;
-using System.ComponentModel;
-using System.Reactive.Linq;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
+using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {
@@ -68,12 +68,20 @@ namespace DeepBrainInterface
 
         private void UpdateState(int activeChannels)
         {
-            var now = DateTime.UtcNow;
-            if ((now - lastStateChange).TotalMilliseconds < MinStateChangeDurationMs)
-                return;
+            var thresholdStrings = DetectionThresholds.Split(',');
+            thresholds = new float[channels];
 
-            var exitThreshold = (int)(RequiredChannels * ExitThresholdMultiplier);
-            
+            // Fill thresholds array, repeating last value if needed
+            for (int i = 0; i < channels; i++)
+            {
+                thresholds[i] = float.Parse(thresholdStrings[Math.Min(i, thresholdStrings.Length - 1)]);
+            }
+        }
+
+        private void UpdateState(IList<float> inputs)
+        {
+            int activeChannels = CountActiveChannels(inputs);
+
             switch (currentState)
             {
                 case RippleState.NoRipple:
@@ -107,12 +115,48 @@ namespace DeepBrainInterface
             }
         }
 
-        private int GetCurrentSkip() => currentState switch
+        private int CountActiveChannels(IList<float> inputs)
         {
-            RippleState.NoRipple => NoRippleSkip,
-            RippleState.PossibleRipple => PossibleRippleSkip,
-            RippleState.DefiniteRipple => DefiniteRippleSkip,
-            _ => NoRippleSkip
-        };
+            int count = 0;
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                if (inputs[i] >= thresholds[i])
+                    count++;
+            }
+            return count;
+        }
+
+        private void UpdateConsecutiveCounts(IList<float> inputs)
+        {
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                if (inputs[i] >= thresholds[i])
+                    consecutiveThresholdCounts[i]++;
+            }
+        }
+
+        private void ResetConsecutiveCounts()
+        {
+            Array.Clear(consecutiveThresholdCounts, 0, consecutiveThresholdCounts.Length);
+        }
+
+        private bool CheckConsecutiveCriteria()
+        {
+            return consecutiveThresholdCounts.Count(c => c >= ConsecutiveSamplesRequired) >= RequiredChannels;
+        }
+
+        private int GetCurrentSkip()
+        {
+            switch (currentState)
+            {
+                case RippleState.NoRipple:
+                    return NoRippleSkip;
+                case RippleState.PossibleRipple:
+                    return PossibleRippleSkip;
+                case RippleState.DefiniteRipple:
+                    return DefiniteRippleSkip;
+                default:
+                    return NoRippleSkip;
+            }
+        }
     }
-}
