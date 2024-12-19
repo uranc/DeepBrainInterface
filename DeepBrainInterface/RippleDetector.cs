@@ -23,6 +23,9 @@ namespace DeepBrainInterface
         [Description("Number of timesteps for the input")]
         public Int64 nTimesteps { get; set; } = 50;
 
+        [Description("Number of channels for the input")]
+        public Int64 nChannels { get; set; } = 8;
+
         [Description("Path to the TensorFlow model file")]
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
         public string ModelPath { get; set; } = @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\simple_frozen_graph.pb";
@@ -31,7 +34,7 @@ namespace DeepBrainInterface
         {
             if (session == null)
             {
-                graph = new Tensorflow.Graph(); // Ensure graph is instantiated
+                graph = new Tensorflow.Graph();
                 graph.as_default();
                 graph.Import(ModelPath);
                 session = new Session(graph);
@@ -47,9 +50,10 @@ namespace DeepBrainInterface
             return source.SelectMany(input =>
             {
                 var results = session.run(outputOperation.outputs[0],
-                    new FeedItem(inputOperation.outputs[0], input.reshape((1, nTimesteps, 8))));
+                    new FeedItem(inputOperation.outputs[0], input.reshape((1, nTimesteps, nChannels))));
                 return Observable.Return(np.squeeze(results).ToArray<float>());
             });
         }
     }
 }
+

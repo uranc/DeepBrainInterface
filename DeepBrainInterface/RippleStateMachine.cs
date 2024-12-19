@@ -14,161 +14,105 @@ namespace DeepBrainInterface
         DefiniteRipple
     }
 
-    [Description("Tracks ripple states across multiple channels")]
+    public class RippleStateInfo
+    {
+        public RippleState State { get; set; }
+        public int CurrentSkip { get; set; }
+        public int ActiveChannels { get; set; }
+    }
+
+    [Description("Tracks ripple states across multiple channels and controls skip logic for downstream nodes.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleStateMachine : Transform<IList<float>, RippleStateInfo>
     {
         private RippleState currentState = RippleState.NoRipple;
-        private int eventCount = 0;
-        private DateTime lastRippleTime = DateTime.MinValue;
-        private float[] consecutiveThresholdCounts;
-        private int channels = 1;
 
-        [Description("Threshold values for each channel (comma-separated)")]
-        public string DetectionThresholds { get; set; } = "0.7";
+        [Description("Threshold for ripple detection on channels.")]
+        public float DetectionThreshold { get; set; } = 0.7f;
 
-        [Description("Number of channels required to exceed threshold")]
+        [Description("Number of channels required to exceed threshold.")]
         public int RequiredChannels { get; set; } = 1;
 
-        [Description("Number of consecutive samples above threshold for definite ripple")]
+        [Description("Number of consecutive samples required to enter DefiniteRipple state.")]
         public int ConsecutiveSamplesRequired { get; set; } = 3;
 
-        [Description("Buffer skip value for each state")]
+        [Description("Skip rate for NoRipple state.")]
         public int NoRippleSkip { get; set; } = 10;
+
+        [Description("Skip rate for PossibleRipple state.")]
         public int PossibleRippleSkip { get; set; } = 5;
+
+        [Description("Skip rate for DefiniteRipple state.")]
         public int DefiniteRippleSkip { get; set; } = 1;
 
-        private float[] thresholds;
+        private int consecutiveCount = 0;
+        private const float ExitThresholdMultiplier = 0.8f; // Hysteresis
+        private DateTime lastStateChange = DateTime.MinValue;
+        private const int MinStateChangeDurationMs = 50;
 
         public override IObservable<RippleStateInfo> Process(IObservable<IList<float>> source)
         {
             return source.Select(inputs =>
             {
-                // Lazy initialization of channel-specific settings
-                if (consecutiveThresholdCounts == null || channels != inputs.Count)
-                {
-                    channels = inputs.Count;
-                    consecutiveThresholdCounts = new float[channels];
-                    InitializeThresholds();
-                }
+                int activeChannels = inputs.Count(v => v > DetectionThreshold);
+                UpdateState(activeChannels);
 
-                UpdateState(inputs);
                 return new RippleStateInfo
                 {
                     State = currentState,
                     CurrentSkip = GetCurrentSkip(),
-                    EventCount = eventCount,
-                    TimeSinceLastRipple = DateTime.Now - lastRippleTime,
-                    ModelOutputs = inputs.ToList(), // Store all channel values
-                    ActiveChannels = CountActiveChannels(inputs)
+                    ActiveChannels = activeChannels
                 };
             });
         }
 
-        private void InitializeThresholds()
+        private void UpdateState(int activeChannels)
         {
-            var thresholdStrings = DetectionThresholds.Split(',');
-            thresholds = new float[channels];
+            var now = DateTime.UtcNow;
+            if ((now - lastStateChange).TotalMilliseconds < MinStateChangeDurationMs)
+                return;
+
+            var exitThreshold = (int)(RequiredChannels * ExitThresholdMultiplier);
             
-            // Fill thresholds array, repeating last value if needed
-            for (int i = 0; i < channels; i++)
-            {
-                thresholds[i] = float.Parse(thresholdStrings[Math.Min(i, thresholdStrings.Length - 1)]);
-            }
-        }
-
-        private void UpdateState(IList<float> inputs)
-        {
-            int activeChannels = CountActiveChannels(inputs);
-
             switch (currentState)
             {
                 case RippleState.NoRipple:
                     if (activeChannels >= RequiredChannels)
                     {
                         currentState = RippleState.PossibleRipple;
-                        ResetConsecutiveCounts();
-                        UpdateConsecutiveCounts(inputs);
+                        lastStateChange = now;
                     }
                     break;
 
                 case RippleState.PossibleRipple:
                     if (activeChannels >= RequiredChannels)
                     {
-                        UpdateConsecutiveCounts(inputs);
-                        if (CheckConsecutiveCriteria())
-                        {
-                            currentState = RippleState.DefiniteRipple;
-                            eventCount++;
-                            lastRippleTime = DateTime.Now;
-                        }
+                        consecutiveCount++;
+                        if (consecutiveCount >= ConsecutiveSamplesRequired) currentState = RippleState.DefiniteRipple;
                     }
                     else
                     {
                         currentState = RippleState.NoRipple;
-                        ResetConsecutiveCounts();
+                        consecutiveCount = 0;
                     }
                     break;
 
                 case RippleState.DefiniteRipple:
-                    if (activeChannels < RequiredChannels)
+                    if (activeChannels < exitThreshold)
                     {
-                        currentState = RippleState.NoRipple;
-                        ResetConsecutiveCounts();
+                        currentState = RippleState.PossibleRipple;
+                        lastStateChange = now;
                     }
                     break;
             }
         }
 
-        private int CountActiveChannels(IList<float> inputs)
+        private int GetCurrentSkip() => currentState switch
         {
-            int count = 0;
-            for (int i = 0; i < inputs.Count; i++)
-            {
-                if (inputs[i] >= thresholds[i])
-                    count++;
-            }
-            return count;
-        }
-
-        private void UpdateConsecutiveCounts(IList<float> inputs)
-        {
-            for (int i = 0; i < inputs.Count; i++)
-            {
-                if (inputs[i] >= thresholds[i])
-                    consecutiveThresholdCounts[i]++;
-            }
-        }
-
-        private void ResetConsecutiveCounts()
-        {
-            Array.Clear(consecutiveThresholdCounts, 0, consecutiveThresholdCounts.Length);
-        }
-
-        private bool CheckConsecutiveCriteria()
-        {
-            return consecutiveThresholdCounts.Count(c => c >= ConsecutiveSamplesRequired) >= RequiredChannels;
-        }
-
-        private int GetCurrentSkip()
-        {
-            return currentState switch
-            {
-                RippleState.NoRipple => NoRippleSkip,
-                RippleState.PossibleRipple => PossibleRippleSkip,
-                RippleState.DefiniteRipple => DefiniteRippleSkip,
-                _ => NoRippleSkip
-            };
-        }
-    }
-
-    public class RippleStateInfo
-    {
-        public RippleState State { get; set; }
-        public int CurrentSkip { get; set; }
-        public int EventCount { get; set; }
-        public TimeSpan TimeSinceLastRipple { get; set; }
-        public List<float> ModelOutputs { get; set; }
-        public int ActiveChannels { get; set; }
+            RippleState.NoRipple => NoRippleSkip,
+            RippleState.PossibleRipple => PossibleRippleSkip,
+            RippleState.DefiniteRipple => DefiniteRippleSkip,
+            _ => NoRippleSkip
+        };
     }
 }
