@@ -10,68 +10,98 @@ namespace DeepBrainInterface
     public class RunningZScore : Transform<Mat, Mat>
     {
         private Mat runningMean;
-        private Mat runningM2;
-        private int count;
+        private Mat runningVariance;
+        private double forgettingFactor;
 
         [Description("The window size for computing running statistics.")]
-        public int WindowSize { get; set; } = 50;
+        public int WindowSize
+        {
+            get { return _windowSize; }
+            set
+            {
+                _windowSize = value;
+                forgettingFactor = 2.0 / (_windowSize + 1); // Exponential moving average factor
+            }
+        }
+        private int _windowSize = 50;
 
         [Description("Number of channels in the input data.")]
         public int Channels { get; set; } = 8;
+
+        public RunningZScore()
+        {
+            forgettingFactor = 2.0 / (WindowSize + 1);
+        }
 
         public override IObservable<Mat> Process(IObservable<Mat> source)
         {
             return source.Select(input =>
             {
                 // Validate input dimensions
-                if (input.Cols != Channels)
+                if (input.Rows != Channels)
                 {
-                    throw new ArgumentException($"Input matrix must have {Channels} columns (channels). Got {input.Cols} instead.");
+                    throw new ArgumentException($"Input matrix must have {Channels} rows (channels). Got {input.Rows} instead.");
+                }
+
+                // Convert input to F32 if needed
+                Mat processedInput = input;
+                if (input.Depth != Depth.F32 && input.Depth != Depth.F64)
+                {
+                    processedInput = new Mat(input.Size, Depth.F32, input.Channels);
+                    CV.Convert(input, processedInput);
                 }
 
                 // Initialize statistics matrices if needed
-                if (runningMean == null || runningMean.Cols != input.Cols)
+                if (runningMean == null || runningMean.Rows != Channels || runningMean.Cols != processedInput.Cols)
                 {
-                    runningMean = new Mat(1, Channels, input.Depth, 1);
-                    runningM2 = new Mat(1, Channels, input.Depth, 1);
-                    count = 0;
+                    runningMean = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                    CV.Copy(processedInput, runningMean);
+
+                    // Initialize variance with small values to avoid division by zero
+                    runningVariance = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                    runningVariance.Set(Scalar.All(1e-4));
+                    return new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels); // Return zeros for first sample
                 }
 
-                count = Math.Min(count + 1, WindowSize);
-                var scale = 1.0 / count;
+                // Compute delta (difference from mean)
+                Mat delta = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                CV.Sub(processedInput, runningMean, delta);
 
-                // Process each timepoint
-                var output = new Mat(input.Rows, input.Cols, input.Depth, input.Channels);
-                for (int t = 0; t < input.Rows; t++)
+                // Update running mean 
+                CV.ScaleAdd(delta, new Scalar(forgettingFactor), runningMean, runningMean);
+
+                // Update running variance: var = (1-ff) * var + ff * delta²
+                Mat deltaSquared = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                CV.Mul(delta, delta, deltaSquared);
+                CV.ConvertScale(runningVariance, runningVariance, 1.0 - forgettingFactor);
+                CV.ScaleAdd(deltaSquared, new Scalar(forgettingFactor), runningVariance, runningVariance);
+
+                // Compute standard deviation
+                Mat stdDev = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                CV.Pow(runningVariance, stdDev, 0.5);
+
+                // Ensure minimum std dev to avoid division by zero
+                for (int i = 0; i < stdDev.Rows; i++)
                 {
-                    var currentRow = input.GetRow(t);
-
-                    // Update running statistics
-                    var delta = new Mat(1, Channels, input.Depth, 1);
-                    CV.Sub(currentRow, runningMean, delta);
-                    CV.ScaleAdd(delta, new Scalar(scale), runningMean, runningMean);
-
-                    var delta2 = new Mat(1, Channels, input.Depth, 1);
-                    CV.Mul(delta, delta, delta2);
-                    var m2Scale = (count - 1.0) / count;
-                    CV.ScaleAdd(runningM2, new Scalar(m2Scale), delta2, runningM2);
-
-                    // Compute z-score for current timepoint
-                    if (count > 1)
+                    for (int j = 0; j < stdDev.Cols; j++)
                     {
-                        var std = new Mat(1, Channels, input.Depth, 1);
-                        CV.Copy(runningM2, std);
-                        CV.Pow(std, std, 0.5);
-
-                        var zScore = new Mat(1, Channels, input.Depth, 1);
-                        CV.Sub(currentRow, runningMean, zScore);
-                        CV.Div(zScore, std, zScore);
-
-                        CV.Copy(zScore, output.GetRow(t));
+                        if (stdDev.GetReal(i, j) < 1e-10)
+                        {
+                            stdDev.SetReal(i, j, 1e-10);
+                        }
                     }
                 }
 
-                return output;
+                // Calculate z-score
+                Mat zScore = new Mat(processedInput.Size, processedInput.Depth, processedInput.Channels);
+                CV.Div(delta, stdDev, zScore);
+
+                // Clean up
+                delta.Dispose();
+                deltaSquared.Dispose();
+                stdDev.Dispose();
+
+                return zScore;
             });
         }
     }
