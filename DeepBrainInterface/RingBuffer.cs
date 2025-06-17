@@ -9,7 +9,7 @@ using System.Reactive.Subjects;
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Buffers a specified number of Mat elements and outputs them as a single Mat.")]
+    [Description("Buffers a number of Mat elements and outputs them as a single Mat.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RingBuffer
     {
