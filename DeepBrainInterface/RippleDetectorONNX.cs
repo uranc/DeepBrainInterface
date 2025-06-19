@@ -1,206 +1,142 @@
 ﻿using Bonsai;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic; // Add this namespace
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing.Design;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms.Design;
-using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 
 namespace DeepBrainInterface
 {
-    //public enum OnnxProvider { Cpu, Cuda, TensorRT }
+    public enum OnnxProvider { Cpu, Cuda, TensorRT }
 
-    public enum OnnxProvider
-    {
-        Cpu,
-        Cuda,
-        TensorRT
-    }  
-[Combinator]
-    [Description("Runs an ONNX model on streaming Mat data.")]
+    [Combinator]
+    [Description("Runs an ONNX model (CPU / CUDA / TensorRT) on streaming Mat data.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorONNX
     {
-        // ---------- user-configurable properties ----------
+        /* ─────── User parameters ───────────────────────────────────── */
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
-        [Description("Path to the ONNX model file (*.onnx)")]
         public string ModelPath { get; set; } =
             @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\ripple_detector.onnx";
 
-        [Description("Execution provider to use (CPU, CUDA, TensorRT)")]
         public OnnxProvider Provider { get; set; } = OnnxProvider.Cpu;
-
-        [Description("How many incoming frames to batch together. " +
-                     "Use 1 for pure frame-by-frame, >1 for micro-batching.")]
         public int BatchSize { get; set; } = 1;
-
-        [Description("Name of the graph input tensor (leave empty to take the first).")]
         public string InputName { get; set; } = "";
-
-        [Description("Name of the graph output tensor (leave empty to take the first).")]
         public string OutputName { get; set; } = "";
-
-        [Description("Number of timepoints the model expects")]
-        public int ExpectedTimepoints { get; set; } = 1104;
-
-        [Description("Number of channels the model expects")]
+        public int ExpectedTimepoints { get; set; } = 92;
         public int ExpectedChannels { get; set; } = 8;
-        // ---------------------------------------------------
+        /* ────────────────────────────────────────────────────────────── */
 
         InferenceSession _session;
-        string _inputName;
-        string _outputName;
+        string _inputName, _outputName;
+        float[] _reuseBuffer;
+        readonly List<NamedOnnxValue> _container = new List<NamedOnnxValue>(1);
 
-        // Add field for buffer reuse
-        private float[] _reuseBuffer;
-        private List<NamedOnnxValue> _containerCache;
-
-        // One-time initialization – called lazily from Process
+        /* ───── Initialise ORT session lazily ───────────────────────── */
         void Initialize()
         {
             if (_session != null) return;
 
-            var opts = new SessionOptions();
+            var so = new SessionOptions();
+
             try
             {
                 switch (Provider)
                 {
                     case OnnxProvider.Cuda:
-                        try
-                        {
-                            opts.AppendExecutionProvider_CUDA(0);
-                        }
-                        catch (Exception ex)
-                        {
-                            throw new InvalidOperationException(
-                                "CUDA initialization failed. Verify CUDA toolkit and GPU drivers are installed.", ex);
-                        }
+                        so.AppendExecutionProvider_CUDA(0);
                         break;
+
                     case OnnxProvider.TensorRT:
-                        try
-                        {
-                            opts.AppendExecutionProvider_CUDA(0);
-                            opts.AppendExecutionProvider_Tensorrt();
-                        }
-                        catch (Exception ex)
-                        {
-                            throw new InvalidOperationException(
-                                "TensorRT initialization failed. Verify TensorRT and CUDA are properly installed.", ex);
-                        }
+                        so.AppendExecutionProvider_CUDA(0);
+                        so.AppendExecutionProvider_Tensorrt();
                         break;
+
                     case OnnxProvider.Cpu:
                     default:
-                        // CPU provider is always available
                         break;
                 }
-
-                _session = new InferenceSession(ModelPath, opts);
-                _inputName = string.IsNullOrEmpty(InputName)
-                                  ? _session.InputMetadata.First().Key
-                                  : InputName;
-                _outputName = string.IsNullOrEmpty(OutputName)
-                                  ? _session.OutputMetadata.First().Key
-                                  : OutputName;
             }
-            catch (DllNotFoundException ex)
+            catch (Exception ex)
             {
-                // If CUDA DLLs are missing, provide a helpful message
-                var message = ex.Message.Contains("onnxruntime_providers_cuda")
-                    ? "CUDA support DLLs not found. Ensure CUDA toolkit is installed and PATH is set correctly."
-                    : ex.Message;
-                throw new InvalidOperationException(message, ex);
+                Console.WriteLine($"⚠ GPU / TensorRT attach failed → CPU fallback: {ex.Message}");
             }
+
+            _session = new InferenceSession(ModelPath, so);
+            _inputName = string.IsNullOrEmpty(InputName)
+                               ? _session.InputMetadata.First().Key : InputName;
+            _outputName = string.IsNullOrEmpty(OutputName)
+                               ? _session.OutputMetadata.First().Key : OutputName;
+
+            Console.WriteLine("Compiled EPs : " +
+                string.Join(", ", OrtEnv.Instance().GetAvailableProviders()));
         }
 
-        // -------- Optimized ToTensor method ----------
-        DenseTensor<float> ToTensor(List<Mat> mats)
+        /* ───── Mat[channels×time] → 3-D tensor (B,T,C) ─────────────── */
+        DenseTensor<float> ToTensor(IList<Mat> mats)
         {
-            var batchSize = mats.Count;
-            var totalSize = batchSize * ExpectedTimepoints * ExpectedChannels;
+            int B = mats.Count;
+            int N = ExpectedTimepoints;
+            int C = ExpectedChannels;
+            int len = B * N * C;
 
-            // Reuse buffer to avoid allocations
-            if (_reuseBuffer == null || _reuseBuffer.Length < totalSize)
-            {
-                _reuseBuffer = new float[totalSize];
-            }
+            if (_reuseBuffer == null || _reuseBuffer.Length < len)
+                _reuseBuffer = new float[len];
 
             unsafe
             {
-                for (int b = 0; b < batchSize; b++)
+                for (int b = 0; b < B; ++b)
                 {
-                    var m = mats[b];
-
-                    // Direct pointer access for faster data copying
-                    float* srcPtr = (float*)m.Data.ToPointer();
-                    fixed (float* dstPtr = &_reuseBuffer[b * ExpectedTimepoints * ExpectedChannels])
+                    float* src = (float*)mats[b].Data.ToPointer();
+                    fixed (float* dst0 = &_reuseBuffer[b * N * C])
                     {
-                        if (m.Rows == ExpectedChannels && m.Cols == ExpectedTimepoints)
-                        {
-                            // Optimized transpose when dimensions match expectations
-                            for (int channel = 0; channel < ExpectedChannels; channel++)
-                            {
-                                for (int timepoint = 0; timepoint < ExpectedTimepoints; timepoint++)
-                                {
-                                    dstPtr[timepoint * ExpectedChannels + channel] =
-                                        srcPtr[channel * ExpectedTimepoints + timepoint];
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // Direct copy when no transpose needed
-                            Buffer.MemoryCopy(srcPtr, dstPtr,
-                                totalSize * sizeof(float),
-                                ExpectedTimepoints * ExpectedChannels * sizeof(float));
-                        }
+                        // reshape + transpose (channels,row) → (time,channel)
+                        for (int ch = 0; ch < C; ++ch)
+                            for (int t = 0; t < N; ++t)
+                                dst0[t * C + ch] = src[ch * N + t];
                     }
                 }
             }
-
-            return new DenseTensor<float>(_reuseBuffer, new[] { batchSize, ExpectedTimepoints, ExpectedChannels });
+            
+            // Create tensor using array constructor instead of ReadOnlySpan
+            var tensor = new DenseTensor<float>(_reuseBuffer, new[] { B, N, C });
+            
+            return tensor;
         }
 
-        // -------- Optimized Process method ----------
+        /* ───── Streaming processing node ───────────────────────────── */
         public IObservable<Mat> Process(IObservable<Mat> source)
         {
-            // Initialize container cache
-            _containerCache = new List<NamedOnnxValue>(1);
+            return source.Buffer(BatchSize)
+                         .Select(batch =>
+                         {
+                             Initialize();
 
-            return source.Buffer(BatchSize).Select(mats =>
-            {
-                Initialize();
+                             var tensor = ToTensor(batch);
+                             _container.Clear();
+                             _container.Add(NamedOnnxValue.CreateFromTensor(_inputName, tensor));
 
-                var inputTensor = ToTensor(mats.ToList());
+                             var results = _session.Run(_container);
+                             try
+                             {
+                                 var prob = results.First().AsEnumerable<float>().First();
 
-                // Reuse container to avoid allocations
-                _containerCache.Clear();
-                _containerCache.Add(NamedOnnxValue.CreateFromTensor(_inputName, inputTensor));
-
-                using (var results = _session.Run(_containerCache))
-                {
-                    var outputTensor = results.First().AsTensor<float>();
-                    var outputLen = (int)outputTensor.Length;
-
-                    var outputMat = new Mat(1, outputLen, Depth.F32, 1);
-                    unsafe
-                    {
-                        // Direct memory copy for output
-                        fixed (float* srcPtr = outputTensor.ToArray())
-                        {
-                            Buffer.MemoryCopy(srcPtr, outputMat.Data.ToPointer(),
-                                outputLen * sizeof(float),
-                                outputLen * sizeof(float));
-                        }
-                    }
-
-                    return outputMat;
-                }
-            });
+                                 // return a 1×1 Mat with the probability
+                                 var outMat = new Mat(1, 1, Depth.F32, 1);
+                                 Marshal.Copy(new[] { prob }, 0, outMat.Data, 1);
+                                 return outMat;
+                             }
+                             finally
+                             {
+                                 results.Dispose();
+                             }
+                         });
         }
     }
 }
