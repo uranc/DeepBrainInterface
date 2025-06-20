@@ -20,7 +20,7 @@ namespace DeepBrainInterface
     [Combinator]
     [Description("Ultra-low-latency ONNX inference (1×92×8 → 1 float) with per-call timing.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorRealTime : Transform<Mat, Mat>
+    public class RippleDetectorRealTimeBackupSubMilisecond : Transform<Mat, Mat>
     {
         /* ───── user parameters ──────────────────────────────────────── */
 
@@ -181,7 +181,7 @@ namespace DeepBrainInterface
 
         /* ───── cleanup (optional) ──────────────────────────────────────── */
 
-        ~RippleDetectorRealTime()
+        ~RippleDetectorRealTimeBackupSubMilisecond()
         {
             if (bufPin.IsAllocated) bufPin.Free();
             session?.Dispose();

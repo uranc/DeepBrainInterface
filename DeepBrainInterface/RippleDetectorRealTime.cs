@@ -5,20 +5,16 @@ using OpenCV.Net;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Drawing.Design;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows.Forms.Design;
 
 namespace DeepBrainInterface
 {
-    //public enum OnnxProvider { Cpu, Cuda, TensorRT }
-
     [Combinator]
-    [Description("Ultra-low-latency ONNX inference (1×92×8 → 1 float) with per-call timing.")]
+    [Description("Ultra-low-latency ONNX inference (1×T×C → 1 float)")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorRealTime : Transform<Mat, Mat>
     {
@@ -28,16 +24,19 @@ namespace DeepBrainInterface
         public string ModelPath { get; set; } =
             @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\ripple_detector.onnx";
 
-        public OnnxProvider Provider { get; set; } = OnnxProvider.Cpu;
+        [Description("Number of threads for ONNX Runtime inference (2-6 typically best)")]
+        public int NumThreads { get; set; } = 5;
 
         [Description("Set >1 only if you deliberately want micro-batching.")]
         public int BatchSize { get; set; } = 1;
 
-        /* fixed model IO shape ------------------------------------------------ */
-        const int T = 92;   // time-points
-        const int C = 8;    // channels
+        [Description("Number of time-points in the input window")]
+        public int TimePoints { get; set; } = 92;
+
+        [Description("Number of channels in the input data")]
+        public int Channels { get; set; } = 8;
+
         const int OUT_LEN = 1;   // scalar output
-        /* --------------------------------------------------------------------- */
 
         /* ───── internal state ─────────────────────────────────────────────── */
 
@@ -45,18 +44,14 @@ namespace DeepBrainInterface
         string inName, outName;
 
         // pinned reusable input buffer
-        float[] buf = new float[T * C];   // BatchSize is 1 → keep it small
+        float[] buf;
         GCHandle bufPin;
 
         // one reusable container per Run()
         readonly List<NamedOnnxValue> container = new List<NamedOnnxValue>(1);
 
-        /* timing */
-        static readonly Stopwatch swRun = new Stopwatch();
-        static readonly Stopwatch swLoop = Stopwatch.StartNew();
-        static long prevTicks;
-        const int kPrint = 1000;
-        int nAccum; double accRun, accCall;
+        // pre-allocated output tensor
+        float[] outValue;
 
         /* ───── one-time init ─────────────────────────────────────────────── */
 
@@ -64,43 +59,33 @@ namespace DeepBrainInterface
         {
             if (session != null) return;
 
-            Console.WriteLine("Compiled providers  : " +
-                string.Join(", ", OrtEnv.Instance().GetAvailableProviders()));
+            buf = new float[TimePoints * Channels];
+            
             if (!bufPin.IsAllocated) bufPin = GCHandle.Alloc(buf, GCHandleType.Pinned);
 
             var so = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                IntraOpNumThreads = 4,   // tune for your CPU; 2-6 is usually best
-                InterOpNumThreads = 1
+                IntraOpNumThreads = NumThreads,
+                InterOpNumThreads = 1,
+                EnableCpuMemArena = true
             };
-            so.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
 
-            try
-            {
-                if (Provider == OnnxProvider.Cuda)
-                    so.AppendExecutionProvider_CUDA(0);
-                else if (Provider == OnnxProvider.TensorRT)
-                {
-                    so.AppendExecutionProvider_CUDA(0);
-                    so.AppendExecutionProvider_Tensorrt();
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("GPU/TRT attach failed → CPU fallback: " + ex.Message);
-            }
+            so.AddSessionConfigEntry("session.enable_mem_pattern", "1");
+            so.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
+            so.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
+            so.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
 
             session = new InferenceSession(ModelPath, so);
 
             inName = session.InputMetadata.First().Key;
             outName = session.OutputMetadata.First().Key;
 
-            Console.WriteLine("ORT session ready. Providers = {0}",
-                string.Join(", ", OrtEnv.Instance().GetAvailableProviders()));
+            /* Pre-allocate output tensor to avoid allocation during inference */
+            outValue = new float[OUT_LEN];
 
             /* one warm-up run (avoids first-call JIT hit) */
-            var warm = new DenseTensor<float>(buf, new[] { 1, T, C });
+            var warm = new DenseTensor<float>(buf, new[] { 1, TimePoints, Channels });
             using (var dummy = session.Run(
                     new[] { NamedOnnxValue.CreateFromTensor(inName, warm) })) { }
         }
@@ -114,24 +99,30 @@ namespace DeepBrainInterface
                 float* src = (float*)m.Data.ToPointer();
                 float* dst = (float*)bufPin.AddrOfPinnedObject().ToPointer();
 
-                if (m.Rows == C && m.Cols == T)
+                // Optimize for the most common case (C×T, needing transpose)
+                if (m.Rows == Channels && m.Cols == TimePoints)
                 {
-                    /* transpose to [T, C] in place */
-                    for (int c = 0; c < C; ++c)
-                        for (int t = 0; t < T; ++t)
-                            dst[t * C + c] = src[c * T + t];
+                    /* transpose to [T, C] in place - unrolled version */
+                    for (int c = 0; c < Channels; ++c)
+                    {
+                        int srcOffset = c * TimePoints;
+                        for (int t = 0; t < TimePoints; ++t)
+                        {
+                            dst[t * Channels + c] = src[srcOffset + t];
+                        }
+                    }
                 }
-                else if (m.Rows == T && m.Cols == C)
+                else if (m.Rows == TimePoints && m.Cols == Channels)
                 {
                     /* already correct layout – raw memcpy */
                     Buffer.MemoryCopy(src, dst, buf.Length * sizeof(float),
                                       buf.Length * sizeof(float));
                 }
                 else throw new ArgumentException(
-                         $"Unexpected Mat shape {m.Rows}×{m.Cols}; expected 8×92 or 92×8");
+                         $"Unexpected Mat shape {m.Rows}×{m.Cols}; expected {Channels}×{TimePoints} or {TimePoints}×{Channels}");
             }
 
-            return new DenseTensor<float>(buf, new[] { 1, T, C });
+            return new DenseTensor<float>(buf, new[] { 1, TimePoints, Channels });
         }
 
         /* ───── Bonsai pipeline entry point ──────────────────────────────── */
@@ -140,42 +131,28 @@ namespace DeepBrainInterface
         {
             return source.Buffer(BatchSize).Select(batch =>
             {
-                Initialise();                         // lazy, one-time
+                Initialise();  // lazy, one-time
 
                 DenseTensor<float> input = BuildInputTensor(batch[0]);
 
-                container.Clear();
-                container.Add(NamedOnnxValue.CreateFromTensor(inName, input));
+                // Reuse container without clearing/re-adding when possible
+                if (container.Count == 0)
+                {
+                    container.Add(NamedOnnxValue.CreateFromTensor(inName, input));
+                }
+                else
+                {
+                    container[0] = NamedOnnxValue.CreateFromTensor(inName, input);
+                }
 
-                /* timing – pure ORT execution */
-                swRun.Restart();
                 var outMat = new Mat(1, 1, Depth.F32, 1);
                 using (var res = session.Run(container))
                 {
-                    swRun.Stop();
-
-                    float value = res.First().AsEnumerable<float>().First();
-
-                    /* prepare 1×1 Mat */
-                    outMat.SetReal(0, 0, value);
+                    outValue[0] = res.First().AsTensor<float>().FirstOrDefault();
+                    outMat.SetReal(0, 0, outValue[0]);
                 }
 
-                /* call-to-call Δt */
-                long now = swLoop.ElapsedTicks;
-                double usCall = (now - prevTicks) * 1e6 / Stopwatch.Frequency;
-                prevTicks = now;
-
-                double usRun = swRun.ElapsedTicks * 1e6 / Stopwatch.Frequency;
-
-                accRun += usRun;
-                accCall += usCall;
-                if (++nAccum == kPrint)
-                {
-                    Console.WriteLine($"⟨Δt-run⟩={accRun / kPrint:F1} µs   ⟨Δt-call⟩={accCall / kPrint:F1} µs");
-                    nAccum = 0; accRun = accCall = 0;
-                }
-
-                return outMat;   // returning dummy; adapt to your downstream needs
+                return outMat;
             });
         }
 
