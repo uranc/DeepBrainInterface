@@ -14,153 +14,127 @@ using System.Windows.Forms.Design;
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Ultra-low-latency ONNX inference (1×T×C → 1 float)")]
+    [Description("Ultra-low-latency ONNX inference supporting batch sizes 1 or 2 (1×T×C or 2×T×C → multi-channel 1×1 Mat)")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorRealTime : Transform<Mat, Mat>
+    public class RippleDetectorRealTime
     {
-        /* ───── user parameters ──────────────────────────────────────── */
-
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
-        public string ModelPath { get; set; } =
-            @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\ripple_detector.onnx";
+        public string ModelPath { get; set; }
+            = @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\ripple_detector.onnx";
 
-        [Description("Number of threads for ONNX Runtime inference (2-6 typically best)")]
+        [Description("ONNX Runtime threads (2-6 recommended)")]
         public int NumThreads { get; set; } = 5;
 
-        [Description("Set >1 only if you deliberately want micro-batching.")]
+        [Description("Batch size: 1 for single-buffer, 2 for zipped input")]
         public int BatchSize { get; set; } = 1;
 
-        [Description("Number of time-points in the input window")]
+        [Description("Time points per sample")]
         public int TimePoints { get; set; } = 92;
 
-        [Description("Number of channels in the input data")]
+        [Description("Channels per sample")]
         public int Channels { get; set; } = 8;
 
-        const int OUT_LEN = 1;   // scalar output
-
-        /* ───── internal state ─────────────────────────────────────────────── */
-
         InferenceSession session;
-        string inName, outName;
-
-        // pinned reusable input buffer
-        float[] buf;
-        GCHandle bufPin;
-
-        // one reusable container per Run()
-        readonly List<NamedOnnxValue> container = new List<NamedOnnxValue>(1);
-
-        // pre-allocated output tensor
-        float[] outValue;
-
-        /* ───── one-time init ─────────────────────────────────────────────── */
+        string inputName;
+        float[] buffer;
+        GCHandle bufferPin;
+        readonly List<NamedOnnxValue> inputs = new List<NamedOnnxValue>(1);
 
         void Initialise()
         {
             if (session != null) return;
+            // allocate pinned buffer for BatchSize*T*C
+            buffer = new float[BatchSize * TimePoints * Channels];
+            bufferPin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
 
-            buf = new float[TimePoints * Channels];
-            
-            if (!bufPin.IsAllocated) bufPin = GCHandle.Alloc(buf, GCHandleType.Pinned);
-
-            var so = new SessionOptions
+            var options = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 IntraOpNumThreads = NumThreads,
                 InterOpNumThreads = 1,
                 EnableCpuMemArena = true
             };
+            options.AddSessionConfigEntry("session.enable_mem_pattern", "1");
+            options.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
+            options.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
+            options.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
 
-            so.AddSessionConfigEntry("session.enable_mem_pattern", "1");
-            so.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
-            so.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
-            so.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+            session = new InferenceSession(ModelPath, options);
+            inputName = session.InputMetadata.Keys.First();
 
-            session = new InferenceSession(ModelPath, so);
-
-            inName = session.InputMetadata.First().Key;
-            outName = session.OutputMetadata.First().Key;
-
-            /* Pre-allocate output tensor to avoid allocation during inference */
-            outValue = new float[OUT_LEN];
-
-            /* one warm-up run (avoids first-call JIT hit) */
-            var warm = new DenseTensor<float>(buf, new[] { 1, TimePoints, Channels });
-            using (var dummy = session.Run(
-                    new[] { NamedOnnxValue.CreateFromTensor(inName, warm) })) { }
+            // Warm-up
+            var warmup = new DenseTensor<float>(buffer, new[] { BatchSize, TimePoints, Channels });
+            using (var _ = session.Run(new[] { NamedOnnxValue.CreateFromTensor(inputName, warmup) })) { }
         }
 
-        /* ───── fast path: Mat → pinned array → tensor ───────────────────── */
-
-        DenseTensor<float> BuildInputTensor(Mat m)
+        DenseTensor<float> BuildTensor(params Mat[] mats)
         {
+            int stride = TimePoints * Channels;
             unsafe
             {
-                float* src = (float*)m.Data.ToPointer();
-                float* dst = (float*)bufPin.AddrOfPinnedObject().ToPointer();
-
-                // Optimize for the most common case (C×T, needing transpose)
-                if (m.Rows == Channels && m.Cols == TimePoints)
+                var dstBase = (float*)bufferPin.AddrOfPinnedObject().ToPointer();
+                for (int i = 0; i < mats.Length; i++)
                 {
-                    /* transpose to [T, C] in place - unrolled version */
-                    for (int c = 0; c < Channels; ++c)
+                    float* src = (float*)mats[i].Data.ToPointer();
+                    float* dst = dstBase + i * stride;
+                    if (mats[i].Rows == TimePoints && mats[i].Cols == Channels)
                     {
-                        int srcOffset = c * TimePoints;
-                        for (int t = 0; t < TimePoints; ++t)
-                        {
-                            dst[t * Channels + c] = src[srcOffset + t];
-                        }
+                        Buffer.MemoryCopy(src, dst, stride * sizeof(float), stride * sizeof(float));
                     }
+                    else if (mats[i].Rows == Channels && mats[i].Cols == TimePoints)
+                    {
+                        for (int c = 0; c < Channels; c++)
+                            for (int t = 0; t < TimePoints; t++)
+                                dst[t * Channels + c] = src[c * TimePoints + t];
+                    }
+                    else throw new ArgumentException($"Unexpected Mat shape {mats[i].Rows}×{mats[i].Cols}");
                 }
-                else if (m.Rows == TimePoints && m.Cols == Channels)
-                {
-                    /* already correct layout – raw memcpy */
-                    Buffer.MemoryCopy(src, dst, buf.Length * sizeof(float),
-                                      buf.Length * sizeof(float));
-                }
-                else throw new ArgumentException(
-                         $"Unexpected Mat shape {m.Rows}×{m.Cols}; expected {Channels}×{TimePoints} or {TimePoints}×{Channels}");
             }
-
-            return new DenseTensor<float>(buf, new[] { 1, TimePoints, Channels });
+            return new DenseTensor<float>(buffer, new[] { BatchSize, TimePoints, Channels });
         }
 
-        /* ───── Bonsai pipeline entry point ──────────────────────────────── */
-
-        public override IObservable<Mat> Process(IObservable<Mat> source)
+        // Single-buffer path
+        public IObservable<Mat> Process(IObservable<Mat> source)
         {
-            return source.Buffer(BatchSize).Select(batch =>
-            {
-                Initialise();  // lazy, one-time
-
-                DenseTensor<float> input = BuildInputTensor(batch[0]);
-
-                // Reuse container without clearing/re-adding when possible
-                if (container.Count == 0)
-                {
-                    container.Add(NamedOnnxValue.CreateFromTensor(inName, input));
-                }
-                else
-                {
-                    container[0] = NamedOnnxValue.CreateFromTensor(inName, input);
-                }
-
-                var outMat = new Mat(1, 1, Depth.F32, 1);
-                using (var res = session.Run(container))
-                {
-                    outValue[0] = res.First().AsTensor<float>().FirstOrDefault();
-                    outMat.SetReal(0, 0, outValue[0]);
-                }
-
-                return outMat;
-            });
+            if (BatchSize != 1)
+                throw new InvalidOperationException("BatchSize must be 1 for single-buffer input.");
+            return source.Select(m => RunInference(m));
         }
 
-        /* ───── cleanup (optional) ──────────────────────────────────────── */
+        // Dual-buffer zipped path
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
+        {
+            if (BatchSize != 2)
+                throw new InvalidOperationException("BatchSize must be 2 for Tuple<Mat,Mat> input.");
+            return source.Select(t => RunInference(t.Item1, t.Item2));
+        }
+
+        private Mat RunInference(params Mat[] mats)
+        {
+            Initialise();
+            var tensor = BuildTensor(mats);
+            var named = NamedOnnxValue.CreateFromTensor(inputName, tensor);
+
+            inputs.Clear(); inputs.Add(named);
+            using (var results = session.Run(inputs))
+            {
+                var outTensor = results.First().AsTensor<float>();
+                var flat = outTensor.ToArray();
+                // pack into a 1×1 Mat with BatchSize channels
+                var outMat = new Mat(1, 1, Depth.F32, BatchSize);
+                unsafe
+                {
+                    float* dst = (float*)outMat.Data.ToPointer();
+                    for (int ch = 0; ch < BatchSize; ch++)
+                        dst[ch] = flat[ch];
+                }
+                return outMat;
+            }
+        }
 
         ~RippleDetectorRealTime()
         {
-            if (bufPin.IsAllocated) bufPin.Free();
+            if (bufferPin.IsAllocated) bufferPin.Free();
             session?.Dispose();
         }
     }
