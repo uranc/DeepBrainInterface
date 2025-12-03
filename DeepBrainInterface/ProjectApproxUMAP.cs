@@ -3,50 +3,51 @@ using OpenCV.Net;
 using Python.Runtime;
 using System;
 using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Reactive.Linq;
-using System.Windows.Forms;
 using System.Drawing.Design;
+using System.IO;
+using System.Reactive.Linq;
+using System.Runtime.InteropServices;
+using System.Windows.Forms.Design; // Ensure System.Design is referenced
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Projects high-dimensional input data into a low-dimensional embedding using ApproxAlignedUMAP in transform mode. " +
-                 "A pretrained model is loaded once and used to project new data. Any NaN values in the input are replaced with 0.")]
+    [Description("Projects high-dimensional input data into a low-dimensional embedding using ApproxAlignedUMAP in transform mode.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class ProjectApproxUMAP
     {
         private string defaultHomeFolder;
+        private string pretrainedModelPath;
+        private string pythonEnvPath;
+
+        // Python objects held globally for the session
+        private bool initialized = false;
+        private dynamic pretrainedModel = null;
+        private dynamic npModule = null;
 
         public ProjectApproxUMAP()
         {
-            // Initialize with user's home directory
+            // Initialize with user's home directory defaults
             defaultHomeFolder = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             pretrainedModelPath = Path.Combine(defaultHomeFolder, "Documents", "frozen_models", "umap_approx_model.pkl");
             pythonEnvPath = Path.Combine(defaultHomeFolder, "anaconda3");
         }
 
-        [Description("If true, loads a pretrained model from PretrainedModelPath and uses its transform() method.")]
+        [Description("If true, loads a pretrained model from PretrainedModelPath.")]
         public bool UsePretrained { get; set; } = true;
 
-        private string pretrainedModelPath;
-        
         [FileNameFilter("Pickle Files|*.pkl|All Files|*.*")]
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
         [Description("Path to the pretrained ApproxAlignedUMAP model (pickle file).")]
-        public string PretrainedModelPath 
-        { 
-            get { return pretrainedModelPath; } 
-            set 
-            { 
+        public string PretrainedModelPath
+        {
+            get { return pretrainedModelPath; }
+            set
+            {
                 pretrainedModelPath = value;
-                // Reset initialized state to force reloading the model
                 initialized = false;
             }
         }
-
-        private string pythonEnvPath;
 
         [Editor(typeof(FolderNameEditor), typeof(UITypeEditor))]
         [Description("Path to the Python/Anaconda environment folder containing the required packages.")]
@@ -56,7 +57,6 @@ namespace DeepBrainInterface
             set
             {
                 pythonEnvPath = value;
-                // Reset initialized state to force reloading the environment
                 initialized = false;
             }
         }
@@ -67,66 +67,116 @@ namespace DeepBrainInterface
         [Description("Number of output embedding dimensions.")]
         public int OutputDimensions { get; set; } = 2;
 
-        private bool initialized = false;
-        private dynamic pretrainedModel = null;
-        private dynamic npModule = null;
-        private dynamic approxUmapModule = null;
+        public IObservable<Mat> Process(IObservable<Mat> source)
+        {
+            // Defer allows us to run initialization logic once per workflow start
+            return Observable.Defer(() =>
+            {
+                EnsureInitialized();
+
+                return source.Select(input =>
+                {
+                    float[,] data = ConvertMatToArray(input);
+                    float[,] embedding = ApplyUMAP(data);
+                    return ConvertArrayToMat(embedding);
+                });
+            });
+        }
 
         private void EnsureInitialized()
         {
             if (initialized) return;
 
             string envPath = PythonEnvPath;
+            // Note: If you upgrade conda, this might change to python311.dll
             string pythonDll = Path.Combine(envPath, "python310.dll");
 
             if (!File.Exists(pythonDll))
-                throw new InvalidOperationException("python310.dll not found in the specified Anaconda environment.");
+                throw new InvalidOperationException($"python310.dll not found in {envPath}");
 
+            // Set Environment Variables required for Python.Runtime to find the environment
             Environment.SetEnvironmentVariable("PYTHONHOME", envPath);
-            Environment.SetEnvironmentVariable("PYTHONPATH",
-                $"{envPath};{envPath}\\Lib;{envPath}\\Lib\\site-packages;{envPath}\\DLLs");
+            Environment.SetEnvironmentVariable("PYTHONPATH", $"{envPath};{envPath}\\Lib;{envPath}\\Lib\\site-packages;{envPath}\\DLLs");
             string currentPath = Environment.GetEnvironmentVariable("PATH");
             Environment.SetEnvironmentVariable("PATH", $"{envPath};{envPath}\\Library\\bin;{currentPath}");
 
             Runtime.PythonDLL = pythonDll;
-            PythonEngine.PythonHome = envPath;
-            PythonEngine.PythonPath = Environment.GetEnvironmentVariable("PYTHONPATH");
+            if (!PythonEngine.IsInitialized)
+            {
+                PythonEngine.Initialize();
+                PythonEngine.BeginAllowThreads(); // Allow other threads to use Python
+            }
 
-            PythonEngine.Initialize();
             using (Py.GIL())
             {
                 npModule = Py.Import("numpy");
-                approxUmapModule = Py.Import("approx_umap");
-            }
+                // approx_umap must be installed in the conda env
+                Py.Import("approx_umap");
 
-            if (UsePretrained)
-            {
-                if (!File.Exists(PretrainedModelPath))
-                    throw new FileNotFoundException($"Pretrained model file not found: {PretrainedModelPath}");
-
-                using (Py.GIL())
+                if (UsePretrained)
                 {
+                    if (!File.Exists(PretrainedModelPath))
+                        throw new FileNotFoundException($"Model file not found: {PretrainedModelPath}");
+
                     dynamic pickle = Py.Import("pickle");
                     dynamic builtins = Py.Import("builtins");
-                    dynamic file = builtins.open(PretrainedModelPath, "rb");
-                    pretrainedModel = pickle.load(file);
-                    file.close();
+
+                    // Safe file opening in Python
+                    using (dynamic file = builtins.open(PretrainedModelPath, "rb"))
+                    {
+                        pretrainedModel = pickle.load(file);
+                    }
                 }
             }
-
             initialized = true;
         }
 
-        public IObservable<Mat> Process(IObservable<Mat> source)
+        private float[,] ApplyUMAP(float[,] data)
         {
-            return source.Select(input =>
+            using (Py.GIL())
             {
-                EnsureInitialized();
-                float[,] data = ConvertMatToArray(input);
-                float[,] embedding = ApplyUMAP(data);
-                Mat output = ConvertArrayToMat(embedding);
-                return output;
-            });
+                // CRITICAL: Wrap PyObjects in 'using' to decrement ref counts and avoid memory leaks
+                using (dynamic npArray = npModule.array(data, dtype: npModule.float32))
+                {
+                    // Check for NaNs safely
+                    dynamic hasNanObj = npModule.any(npModule.isnan(npArray));
+                    bool hasNan = (bool)hasNanObj.AsManagedObject(typeof(bool));
+                    hasNanObj.Dispose(); // Clean up the intermediate bool object
+
+                    if (hasNan)
+                    {
+                        using (dynamic cleanedArray = npModule.nan_to_num(npArray))
+                        using (dynamic embedding = pretrainedModel.transform(cleanedArray))
+                        {
+                            return ConvertEmbeddingToArray(embedding);
+                        }
+                    }
+                    else
+                    {
+                        using (dynamic embedding = pretrainedModel.transform(npArray))
+                        {
+                            return ConvertEmbeddingToArray(embedding);
+                        }
+                    }
+                }
+            }
+        }
+
+        private float[,] ConvertEmbeddingToArray(dynamic embedding)
+        {
+            int rows = (int)embedding.shape[0];
+            int cols = (int)embedding.shape[1];
+            float[,] result = new float[rows, cols];
+
+            using (dynamic npFlat = embedding.flatten())
+            using (dynamic npList = npFlat.tolist())
+            {
+                float[] flatArray = ((float[])npList.AsManagedObject(typeof(float[])));
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                        result[i, j] = flatArray[i * cols + j];
+            }
+            return result;
         }
 
         private float[,] ConvertMatToArray(Mat input)
@@ -152,146 +202,50 @@ namespace DeepBrainInterface
             Marshal.Copy(flat, 0, mat.Data, flat.Length);
             return mat;
         }
-
-        private float[,] ApplyUMAP(float[,] data)
-        {
-            using (Py.GIL())
-            {
-                // Convert C# array to a numpy array (dtype float32)
-                dynamic npArray = npModule.array(data, dtype: npModule.float32);
-
-                // Replace any NaN values with 0 (minimal imputation)
-                if (npModule.any(npModule.isnan(npArray)).ToString().ToLower().Contains("true"))
-                {
-                    // np.nan_to_num replaces nan with 0 by default
-                    npArray = npModule.nan_to_num(npArray);
-                }
-                float[,] result;
-                // Use the pretrained model's transform method.
-                dynamic embedding = pretrainedModel.transform(npArray);
-                result = ConvertEmbeddingToArray(embedding);
-                return result;
-            }
-        }
-
-        private float[,] ConvertEmbeddingToArray(dynamic embedding)
-        {
-            int rows = (int)embedding.shape[0];
-            int cols = (int)embedding.shape[1];
-            float[,] result = new float[rows, cols];
-
-            dynamic npFlat = embedding.flatten().tolist();
-            float[] flatArray = ((float[])npFlat.AsManagedObject(typeof(float[])));
-
-            for (int i = 0; i < rows; i++)
-                for (int j = 0; j < cols; j++)
-                    result[i, j] = flatArray[i * cols + j];
-
-            return result;
-        }
     }
 
-    // Custom attribute to specify file filter for FileNameEditor
+    // --- Editor Helper Classes ---
+
     [AttributeUsage(AttributeTargets.Property)]
     public class FileNameFilterAttribute : Attribute
     {
-        public FileNameFilterAttribute(string filter)
-        {
-            Filter = filter;
-        }
-
+        public FileNameFilterAttribute(string filter) { Filter = filter; }
         public string Filter { get; }
     }
 
-    // Custom FileNameEditor to use our filter attribute
     public class FileNameEditor : UITypeEditor
     {
-        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context)
-        {
-            return UITypeEditorEditStyle.Modal;
-        }
+        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context) => UITypeEditorEditStyle.Modal;
 
         public override object EditValue(ITypeDescriptorContext context, IServiceProvider provider, object value)
         {
-            if (context == null || provider == null)
-                return value;
-
-            using (OpenFileDialog dialog = new OpenFileDialog())
+            using (var dialog = new System.Windows.Forms.OpenFileDialog())
             {
-                // Set default filter
-                dialog.Filter = "All Files (*.*)|*.*";
-                
-                // Check for custom filter attribute
-                FileNameFilterAttribute filterAttr = (FileNameFilterAttribute)context.PropertyDescriptor.Attributes[typeof(FileNameFilterAttribute)];
-                if (filterAttr != null)
-                {
-                    dialog.Filter = filterAttr.Filter;
-                }
+                var attr = context?.PropertyDescriptor?.Attributes[typeof(FileNameFilterAttribute)] as FileNameFilterAttribute;
+                dialog.Filter = attr?.Filter ?? "All Files|*.*";
 
-                // Set initial directory if value is not empty
                 if (value != null && !string.IsNullOrEmpty(value.ToString()))
                 {
-                    try
-                    {
-                        string initialDir = Path.GetDirectoryName(value.ToString());
-                        if (Directory.Exists(initialDir))
-                        {
-                            dialog.InitialDirectory = initialDir;
-                            dialog.FileName = Path.GetFileName(value.ToString());
-                        }
-                    }
-                    catch { /* Ignore directory resolution errors */ }
+                    try { dialog.InitialDirectory = Path.GetDirectoryName(value.ToString()); } catch { }
                 }
 
-                // Show dialog and return selected file
-                if (dialog.ShowDialog() == DialogResult.OK)
-                {
-                    return dialog.FileName;
-                }
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) return dialog.FileName;
             }
-
             return value;
         }
     }
 
-    // Folder name editor for selecting directories
     public class FolderNameEditor : UITypeEditor
     {
-        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context)
-        {
-            return UITypeEditorEditStyle.Modal;
-        }
+        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context) => UITypeEditorEditStyle.Modal;
 
         public override object EditValue(ITypeDescriptorContext context, IServiceProvider provider, object value)
         {
-            if (context == null || provider == null)
-                return value;
-
-            using (FolderBrowserDialog dialog = new FolderBrowserDialog())
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
             {
-                // Set description
-                dialog.Description = "Select Python/Anaconda environment folder";
-                
-                // Set initial directory if value is not empty
-                if (value != null && !string.IsNullOrEmpty(value.ToString()))
-                {
-                    try
-                    {
-                        if (Directory.Exists(value.ToString()))
-                        {
-                            dialog.SelectedPath = value.ToString();
-                        }
-                    }
-                    catch { /* Ignore directory resolution errors */ }
-                }
-
-                // Show dialog and return selected folder
-                if (dialog.ShowDialog() == DialogResult.OK)
-                {
-                    return dialog.SelectedPath;
-                }
+                if (value != null && Directory.Exists(value.ToString())) dialog.SelectedPath = value.ToString();
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) return dialog.SelectedPath;
             }
-
             return value;
         }
     }

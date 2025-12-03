@@ -5,18 +5,20 @@ using System.Threading;
 using System.Windows.Forms;
 using Bonsai;
 using OpenCV.Net;
-using System.Reactive;
+using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using ZedGraph;
 
 namespace DeepBrainInterface
 {
+    // CHANGE: Inherit from Sink<Mat> instead of Combinator.
+    // This fixes the "does not implement inherited abstract member" error automatically.
     [Combinator]
-    [Description("Real-time 2D scatter plot of 1×2 CV_32F Mats (X,Y) using ZedGraph in a dedicated UI thread.")]
-    public class ScatterPlot2D : Combinator
+    [Description("Real-time 2D scatter plot of 1x2 CV_32F Mats (X,Y). Uses a circular buffer for high performance.")]
+    public class ScatterPlot2D : Sink<Mat>
     {
-        [Description("Maximum number of points to retain in the plot (0 = no limit).")]
-        public int Capacity { get; set; } = 0;
+        [Description("Maximum number of points to retain in the plot.")]
+        public int Capacity { get; set; } = 1000;
 
         [Description("Size of each scatter symbol.")]
         public int SymbolSize { get; set; } = 5;
@@ -24,166 +26,125 @@ namespace DeepBrainInterface
         [Description("Automatically rescale axes to fit data.")]
         public bool AutoScale { get; set; } = true;
 
-        // UI thread and synchronization
-        Thread uiThread;
-        ManualResetEvent handleCreated;
+        [Description("X Axis Label")]
+        public string XLabel { get; set; } = "UMAP 1";
 
-        // Form and ZedGraph elements
-        Form form;
-        ZedGraphControl zgc;
-        GraphPane pane;
-        PointPairList points;
-        System.Windows.Forms.NumericUpDown capacityControl;
+        [Description("Y Axis Label")]
+        public string YLabel { get; set; } = "UMAP 2";
 
-        public IObservable<Mat> Process(IObservable<Mat> source)
-        {
-            return Process(source, Observable.Never<Unit>());
-        }
+        // Internal UI references
+        private Form form;
+        private ZedGraphControl zgc;
+        private RollingPointPairList points;
+        private System.Windows.Forms.Timer renderTimer;
 
-        public IObservable<Mat> Process(IObservable<Mat> source, IObservable<Unit> clear)
+        // CHANGE: Added 'override' keyword because we are now satisfying Sink<Mat>'s contract
+        public override IObservable<Mat> Process(IObservable<Mat> source)
         {
             return Observable.Create<Mat>(observer =>
             {
-                EnsurePlotWindow();
+                var handleCreated = new ManualResetEvent(false);
 
-                var sourceSubscription = source.Do(mat =>
+                // 1. Create UI Thread
+                var uiThread = new Thread(() =>
                 {
-                    if (mat.Rows != 1 || mat.Cols != 2)
-                        throw new ArgumentException($"ScatterPlot2D expects a 1×2 Mat, got {mat.Rows}×{mat.Cols}.");
+                    form = new Form
+                    {
+                        Text = "Real-time Scatter Plot",
+                        Width = 600,
+                        Height = 600
+                    };
+
+                    zgc = new ZedGraphControl { Dock = DockStyle.Fill };
+                    form.Controls.Add(zgc);
+
+                    var pane = zgc.GraphPane;
+                    pane.Title.Text = "Embedding Space";
+                    pane.XAxis.Title.Text = XLabel;
+                    pane.YAxis.Title.Text = YLabel;
+
+                    points = new RollingPointPairList(Capacity);
+
+                    LineItem curve = pane.AddCurve("Live Data", points, Color.Blue, SymbolType.Circle);
+                    curve.Line.IsVisible = false;
+                    curve.Symbol.Size = SymbolSize;
+                    curve.Symbol.Fill = new Fill(Color.FromArgb(150, Color.Blue));
+                    curve.Symbol.Border.IsVisible = false;
+
+                    // Render Timer (30Hz)
+                    renderTimer = new System.Windows.Forms.Timer();
+                    renderTimer.Interval = 33;
+                    renderTimer.Tick += (s, e) =>
+                    {
+                        if (form.IsDisposed || zgc.IsDisposed) return;
+                        if (AutoScale) pane.AxisChange();
+                        zgc.Invalidate();
+                    };
+                    renderTimer.Start();
+
+                    form.FormClosing += (s, e) =>
+                    {
+                        if (e.CloseReason == CloseReason.UserClosing)
+                        {
+                            e.Cancel = true;
+                            form.Hide();
+                        }
+                    };
+
+                    form.HandleCreated += (s, e) => handleCreated.Set();
+
+                    Application.Run(form);
+                });
+
+                uiThread.SetApartmentState(ApartmentState.STA);
+                uiThread.IsBackground = true;
+                uiThread.Start();
+
+                handleCreated.WaitOne();
+
+                // 2. Data Subscription
+                var sourceSub = source.Do(mat =>
+                {
+                    if (mat.Rows != 1 || mat.Cols != 2) return;
 
                     float x = (float)mat.GetReal(0, 0);
                     float y = (float)mat.GetReal(0, 1);
 
-                    // Plot update on UI thread
-                    form.BeginInvoke((Action)(() =>
+                    if (!form.IsDisposed)
                     {
-                        // Add new point to series
-                        points.Add(x, y);
-
-                        // Keep only the specified number of points if capacity limit is set
-                        if (Capacity > 0 && points.Count > Capacity)
+                        form.BeginInvoke((Action)(() =>
                         {
-                            // Remove oldest points to maintain capacity
-                            while (points.Count > Capacity)
+                            if (points == null) return;
+
+                            // Handle dynamic capacity change
+                            if (points.Capacity != Capacity)
                             {
-                                points.RemoveAt(0);
+                                var newPoints = new RollingPointPairList(Capacity);
+                                newPoints.Add(points);
+                                points = newPoints;
+                                zgc.GraphPane.CurveList[0].Points = points;
                             }
-                        }
 
-                        // Update auto-scale if needed
-                        if (AutoScale) pane.AxisChange();
-
-                        zgc.Invalidate();
-                    }));
+                            points.Add(x, y);
+                        }));
+                    }
                 }).Subscribe(observer);
 
-                var clearSubscription = clear.Subscribe(_ =>
+                // 3. Cleanup Logic
+                return Disposable.Create(() =>
                 {
-                    form.BeginInvoke((Action)(() =>
+                    sourceSub.Dispose();
+                    if (form != null && !form.IsDisposed)
                     {
-                        points.Clear();
-                        if (AutoScale) pane.AxisChange();
-                        zgc.Invalidate();
-                    }));
-                });
-
-                return new System.Reactive.Disposables.CompositeDisposable(sourceSubscription, clearSubscription);
-            });
-        }
-
-        public override IObservable<TSource> Process<TSource>(IObservable<TSource> source)
-        {
-            var matSource = source as IObservable<Mat>;
-            if (matSource == null)
-            {
-                throw new InvalidOperationException("Source must be an IObservable<Mat>.");
-            }
-            return (IObservable<TSource>)Process(matSource);
-        }
-
-        void EnsurePlotWindow()
-        {
-            if (handleCreated != null) return;
-            handleCreated = new ManualResetEvent(false);
-
-            uiThread = new Thread(() =>
-            {
-                Application.EnableVisualStyles();
-
-                form = new Form { Text = "Scatter Plot 2D", Width = 600, Height = 450 };
-                zgc = new ZedGraphControl { Dock = DockStyle.Fill };
-                
-                // Create panel for controls
-                System.Windows.Forms.Panel controlPanel = new System.Windows.Forms.Panel
-                {
-                    Dock = DockStyle.Top,
-                    Height = 40
-                };
-
-                // Capacity control
-                System.Windows.Forms.Label capacityLabel = new System.Windows.Forms.Label
-                {
-                    Text = "Point Capacity:",
-                    AutoSize = true,
-                    Location = new System.Drawing.Point(10, 12)
-                };
-                
-                capacityControl = new System.Windows.Forms.NumericUpDown
-                {
-                    Minimum = 0,
-                    Maximum = 10000,
-                    Value = Capacity,
-                    Location = new System.Drawing.Point(105, 10),
-                    Width = 80
-                };
-                capacityControl.ValueChanged += (s, e) =>
-                {
-                    Capacity = (int)capacityControl.Value;
-                    
-                    // If capacity decreased, trim points
-                    if (Capacity > 0 && points != null && points.Count > Capacity)
-                    {
-                        while (points.Count > Capacity)
+                        form.Invoke((Action)(() =>
                         {
-                            points.RemoveAt(0);
-                        }
-                        zgc.Invalidate();
+                            renderTimer?.Stop();
+                            renderTimer?.Dispose();
+                            form.Dispose();
+                        }));
                     }
-                };
-                
-                controlPanel.Controls.Add(capacityLabel);
-                controlPanel.Controls.Add(capacityControl);
-                
-                form.Controls.Add(controlPanel);
-                form.Controls.Add(zgc);
-
-                pane = zgc.GraphPane;
-                pane.Title.Text = "2D Scatter";
-                pane.XAxis.Title.Text = "X";
-                pane.YAxis.Title.Text = "Y";
-                pane.XAxis.Scale.MinAuto = AutoScale;
-                pane.XAxis.Scale.MaxAuto = AutoScale;
-                pane.YAxis.Scale.MinAuto = AutoScale;
-                pane.YAxis.Scale.MaxAuto = AutoScale;
-
-                // Using PointPairList instead of RollingPointPairList for simplicity
-                points = new PointPairList();
-                var curve = pane.AddCurve("Points", points, Color.Blue, SymbolType.Circle);
-                curve.Line.IsVisible = true;
-                curve.Symbol.Size = SymbolSize;
-                curve.Symbol.Fill.Color = Color.Blue;
-
-                // Signal when handle is created
-                form.HandleCreated += (s, e) => handleCreated.Set();
-
-                Application.Run(form);
+                });
             });
-            uiThread.SetApartmentState(ApartmentState.STA);
-            uiThread.IsBackground = true;
-            uiThread.Start();
-
-            // Wait for form handle before plotting
-            handleCreated.WaitOne();
         }
     }
 }
