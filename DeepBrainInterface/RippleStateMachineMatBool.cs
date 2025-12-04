@@ -7,15 +7,14 @@ using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {
-    // ==============================================================================
     // SHARED TYPES
-    // ==============================================================================
     public enum RippleState { NoRipple, Possible, Ripple }
 
     public sealed class RippleOut
     {
         public RippleState State { get; set; }
         public float Probability { get; set; }
+        public float ArtifactProbability { get; set; }
         public int StrideUsed { get; set; }
         public int EventCount { get; set; }
 
@@ -30,13 +29,16 @@ namespace DeepBrainInterface
     }
 
     [Combinator]
-    [Description("Logic Engine: Probability + BNO Gate → RippleState.")]
+    [Description("Logic Engine: Probability + Artifact + BNO Gate → RippleState.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public sealed class RippleStateMachineMatBool
     {
         // ---- General ----
         [Category("General"), DisplayName("Detection Enabled")]
         public bool DetectionEnabled { get; set; } = true;
+
+        [Category("General"), DisplayName("Artifact Threshold")]
+        public float ArtifactThreshold { get; set; } = 0.5f;
 
         // ---- Thresholds ----
         [Category("Thresholds"), DisplayName("1. Gate (arm)")]
@@ -51,6 +53,13 @@ namespace DeepBrainInterface
         [Category("Thresholds"), DisplayName("4. Event Score (≥ triggers)")]
         public float EventScoreThreshold { get; set; } = 2.5f;
 
+        [Category("Thresholds"), DisplayName("5. Decay Rate")]
+        [Description("Score subtraction per tick when in Possible state (weak signal).")]
+        public float DecayRate { get; set; } = 1.0f;
+
+        [Category("Thresholds"), DisplayName("6. Decay Grace (ticks)")]
+        public int DecayGraceTicks { get; set; } = 5;
+
         // ---- Timing ----
         [Category("TTL"), DisplayName("Trigger Delay (ms)")]
         public int TriggerDelayMs { get; set; } = 0;
@@ -60,9 +69,10 @@ namespace DeepBrainInterface
 
         // ---- Internal ----
         RippleState _state = RippleState.NoRipple;
-        int _scoreTicks;
+        float _scoreTicks;
         int _eventCount;
         float _lastEventScore;
+        int _ticksInPossible;
 
         bool _ttlArmed;
         long _ttlAtMs;
@@ -71,7 +81,7 @@ namespace DeepBrainInterface
 
         static readonly Stopwatch Clock = Stopwatch.StartNew();
 
-        public RippleOut Update(float prob, bool bnoOk, Mat inputData)
+        public RippleOut Update(float signal, float artifact, bool bnoOk, Mat rawInput)
         {
             long now = Clock.ElapsedMilliseconds;
             bool trigger = false;
@@ -85,10 +95,11 @@ namespace DeepBrainInterface
                     _ttlHolding = false;
                     _state = RippleState.NoRipple;
                     _scoreTicks = 0;
+                    _ticksInPossible = 0;
                 }
                 else
                 {
-                    return Pack(prob, false, true, null);
+                    return Pack(signal, artifact, false, true, null);
                 }
             }
 
@@ -99,43 +110,53 @@ namespace DeepBrainInterface
                 _ttlHolding = true;
                 _ttlHoldUntilMs = now + Math.Max(0, PostRippleMs);
                 trigger = true;
-                triggerSnapshot = inputData?.Clone();
-                return Pack(prob, true, true, triggerSnapshot);
+                triggerSnapshot = rawInput?.Clone();
+                return Pack(signal, artifact, true, true, triggerSnapshot);
             }
 
-            // C. Detection Logic
-            bool gatesOn = DetectionEnabled && bnoOk;
+            // C. Gating Logic
+            bool artifactOk = artifact < ArtifactThreshold;
+            bool gatesOn = DetectionEnabled && bnoOk && artifactOk;
+
             if (!gatesOn)
             {
                 _state = RippleState.NoRipple;
                 _scoreTicks = 0;
-                return Pack(prob, false, false, null);
+                _ticksInPossible = 0;
+                return Pack(signal, artifact, false, false, null);
             }
 
-            int eventTicks = Math.Max(1, (int)Math.Ceiling(EventScoreThreshold * 2f));
+            // D. FSM
+            float eventTicksTarget = EventScoreThreshold * 2.0f;
 
             switch (_state)
             {
                 case RippleState.NoRipple:
-                    if (prob >= GateThreshold)
+                    if (signal >= GateThreshold)
                     {
                         _state = RippleState.Possible;
                         _scoreTicks = 0;
+                        _ticksInPossible = 0;
                     }
                     break;
 
                 case RippleState.Possible:
-                    if (prob >= ConfirmThreshold)
-                    {
-                        if (prob >= ConfirmThreshold) _scoreTicks += 2;
-                        else if (prob >= EnterThreshold) _scoreTicks += 1;
+                    _ticksInPossible++;
 
-                        if (_scoreTicks >= eventTicks)
+                    if (signal >= ConfirmThreshold)
+                    {
+                        // Strong signal
+                        if (signal >= ConfirmThreshold) _scoreTicks += 2.0f;
+                        else if (signal >= EnterThreshold) _scoreTicks += 1.0f;
+
+                        // Trigger Check
+                        if (_scoreTicks >= eventTicksTarget)
                         {
                             _state = RippleState.Ripple;
                             _eventCount++;
                             _lastEventScore = _scoreTicks * 0.5f;
                             _scoreTicks = 0;
+                            _ticksInPossible = 0;
 
                             if (TriggerDelayMs > 0)
                             {
@@ -145,39 +166,53 @@ namespace DeepBrainInterface
                             else
                             {
                                 trigger = true;
-                                triggerSnapshot = inputData?.Clone();
+                                triggerSnapshot = rawInput?.Clone();
                                 _ttlHolding = true;
                                 _ttlHoldUntilMs = now + Math.Max(0, PostRippleMs);
                             }
                         }
                     }
-                    else if (prob < GateThreshold)
+                    else if (signal < GateThreshold)
                     {
+                        // Drop below Gate -> Immediate Reset
                         _state = RippleState.NoRipple;
                         _scoreTicks = 0;
+                        _ticksInPossible = 0;
+                    }
+                    else
+                    {
+                        // Weak signal (Gate <= signal < Confirm)
+                        // Apply Decay after grace period
+                        if (_ticksInPossible > DecayGraceTicks)
+                        {
+                            _scoreTicks -= DecayRate;
+                            if (_scoreTicks < 0) _scoreTicks = 0; // Clamp at 0
+                        }
                     }
                     break;
 
                 case RippleState.Ripple:
-                    // Exit Logic: Drop below Gate
-                    if (prob < GateThreshold)
+                    // Exit Logic
+                    if (signal < GateThreshold)
                     {
                         _state = RippleState.NoRipple;
                         _scoreTicks = 0;
+                        _ticksInPossible = 0;
                     }
                     break;
             }
 
-            return Pack(prob, trigger, _ttlHolding || _ttlArmed, triggerSnapshot);
+            return Pack(signal, artifact, trigger, _ttlHolding || _ttlArmed, triggerSnapshot);
         }
 
-        private RippleOut Pack(float d, bool pulse, bool ttl, Mat data)
+        private RippleOut Pack(float signal, float artifact, bool pulse, bool ttl, Mat data)
         {
             return new RippleOut
             {
                 State = _state,
                 Score = _scoreTicks * 0.5f,
-                Probability = d,
+                Probability = signal,
+                ArtifactProbability = artifact,
                 EventCount = _eventCount,
                 LastEventScore = _lastEventScore,
                 EventPulse = pulse,
@@ -188,13 +223,27 @@ namespace DeepBrainInterface
             };
         }
 
+        // Compatibility Overloads
         public IObservable<RippleOut> Process(IObservable<Mat> source)
         {
             return source.Select(m =>
             {
-                float val = 0;
-                if (m.Depth == Depth.F32) unsafe { val = *((float*)m.Data.ToPointer()); }
-                return Update(val, true, null);
+                float sig = 0, art = 0;
+                int totalElements = m.Rows * m.Cols * m.Channels;
+                if (totalElements >= 2 && m.Depth == Depth.F32)
+                {
+                    unsafe
+                    {
+                        float* ptr = (float*)m.Data.ToPointer();
+                        sig = ptr[0];
+                        art = ptr[1];
+                    }
+                }
+                else if (m.Depth == Depth.F32)
+                {
+                    unsafe { sig = *((float*)m.Data.ToPointer()); }
+                }
+                return Update(sig, art, true, m);
             });
         }
 
@@ -202,9 +251,23 @@ namespace DeepBrainInterface
         {
             return source.Select(t =>
             {
-                float val = 0;
-                if (t.Item1.Depth == Depth.F32) unsafe { val = *((float*)t.Item1.Data.ToPointer()); }
-                return Update(val, t.Item2, null);
+                float sig = 0, art = 0;
+                Mat m = t.Item1;
+                int totalElements = m.Rows * m.Cols * m.Channels;
+                if (totalElements >= 2 && m.Depth == Depth.F32)
+                {
+                    unsafe
+                    {
+                        float* ptr = (float*)m.Data.ToPointer();
+                        sig = ptr[0];
+                        art = ptr[1];
+                    }
+                }
+                else if (m.Depth == Depth.F32)
+                {
+                    unsafe { sig = *((float*)m.Data.ToPointer()); }
+                }
+                return Update(sig, art, t.Item2, m);
             });
         }
     }

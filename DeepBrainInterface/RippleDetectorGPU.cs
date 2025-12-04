@@ -85,12 +85,9 @@ namespace DeepBrainInterface
             // 3. Session Options
             var opts = new SessionOptions
             {
-                // SEQUENTIAL is mandatory to allow our manual thread tuning to take effect cleanly
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-
-                // FULL USER CONTROL OVER THREADING
                 IntraOpNumThreads = IntraOpNumThreads,
                 InterOpNumThreads = InterOpNumThreads
             };
@@ -137,7 +134,6 @@ namespace DeepBrainInterface
             long[] outputShape = new long[modelDims.Length];
             long totalSize = 1;
 
-            // Detect Rank 3 vs Rank 2
             for (int i = 0; i < modelDims.Length; i++)
             {
                 long dim = modelDims[i];
@@ -173,6 +169,9 @@ namespace DeepBrainInterface
                     int stride = TimePoints * Channels;
                     for (int b = 0; b < BatchSize; b++)
                     {
+                        // Safety check: if user sends 1 mat but BatchSize=2, stop to avoid crash
+                        if (b >= batch.Count) break;
+
                         float* src = (float*)batch[b].Data.ToPointer();
                         float* dst = dstBase + (b * stride);
                         Buffer.MemoryCopy(src, dst, stride * sizeof(float), stride * sizeof(float));
@@ -195,7 +194,9 @@ namespace DeepBrainInterface
                     int stride = _outputBuffer.Length / BatchSize;
                     for (int i = 0; i < BatchSize; i++)
                     {
-                        outDst[i] = src[i * stride];
+                        // Grab the LAST timepoint of the window for each batch item
+                        int index = (i * stride) + (stride - 1);
+                        outDst[i] = src[index];
                     }
                 }
             }
@@ -211,8 +212,17 @@ namespace DeepBrainInterface
             return outMat;
         }
 
+        // Standard Overload
         public IObservable<Mat> Process(IObservable<Mat> source) => source.Select(m => ProcessBatch(new[] { m }));
+
+        // List Overload
         public IObservable<Mat> Process(IObservable<IList<Mat>> source) => source.Select(batch => ProcessBatch(batch));
+
+        // NEW OVERLOAD: Zipped Input
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
+        {
+            return source.Select(t => ProcessBatch(new[] { t.Item1, t.Item2 }));
+        }
 
         ~RippleDetectorGPU()
         {
