@@ -20,36 +20,56 @@ namespace DeepBrainInterface
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorAdaptive
     {
-        // 1. MODEL PARAMS
+        // ==============================================================================
+        // 1. MODEL PARAMETERS
+        // ==============================================================================
         [Category("Model")]
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
         public string ModelPath { get; set; } = @"C:\Users\angel\Documents\BonsaiFiles\frozen_models\ripple_detector.onnx";
+
         [Category("Model")] public int BatchSize { get; set; } = 1;
         [Category("Model")] public int TimePoints { get; set; } = 44;
         [Category("Model")] public int Channels { get; set; } = 8;
 
+        // ==============================================================================
         // 2. GENERAL
-        [Category("General"), DisplayName("Detection Enabled")] public bool DetectionEnabled { get; set; } = true;
+        // ==============================================================================
+        [Category("General"), DisplayName("Detection Enabled")]
+        public bool DetectionEnabled { get; set; } = true;
 
-        // 3. STRIDE
-        [Category("Stride K"), DisplayName("K below Gate (Relaxed)")] public int KBelowGate { get; set; } = 5;
-        [Category("Stride K"), DisplayName("K at Gate (Focus)")] public int KAtGate { get; set; } = 1;
+        // ==============================================================================
+        // 3. STRIDE K
+        // ==============================================================================
+        [Category("Stride K"), DisplayName("K below Gate (Relaxed)")]
+        public int KBelowGate { get; set; } = 5;
 
+        [Category("Stride K"), DisplayName("K at Gate (Focus)")]
+        public int KAtGate { get; set; } = 1;
+
+        // ==============================================================================
         // 4. LOGIC
+        // ==============================================================================
         [Category("Logic")]
         [TypeConverter(typeof(ExpandableObjectConverter))]
         public RippleStateMachineMatBool StateMachine { get; set; } = new RippleStateMachineMatBool();
 
-        // STATE
+        // ==============================================================================
+        // INTERNAL STATE
+        // ==============================================================================
         InferenceSession _session;
         OrtIoBinding _ioBinding;
         RunOptions _runOptions;
+
         OrtValue _inputOrtValue;
         OrtValue _outputOrtValue;
         float[] _inputBuffer;
         float[] _outputBuffer;
+
         int _strideCounter;
         int _currentK = 1;
+
+        // Helper Struct
+        struct InputPackage { public Mat[] Mats; public bool BnoOk; }
 
         private void Initialise()
         {
@@ -58,6 +78,7 @@ namespace DeepBrainInterface
 
             _inputBuffer = new float[BatchSize * TimePoints * Channels];
 
+            // Hardcoded CPU Single Thread
             var opts = new SessionOptions
             {
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
@@ -69,14 +90,17 @@ namespace DeepBrainInterface
 
             _session = new InferenceSession(ModelPath, opts);
             _runOptions = new RunOptions();
-            _ioBinding = _session.CreateIoBinding();
 
+            _ioBinding = _session.CreateIoBinding();
+            var inputName = _session.InputMetadata.Keys.First();
+            var outputName = _session.OutputMetadata.Keys.First();
             var memInfo = OrtMemoryInfo.DefaultInstance;
+
             long[] inputShape = new long[] { BatchSize, TimePoints, Channels };
             _inputOrtValue = OrtValue.CreateTensorValueFromMemory<float>(memInfo, _inputBuffer, inputShape);
-            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
+            _ioBinding.BindInput(inputName, _inputOrtValue);
 
-            var modelDims = _session.OutputMetadata[_session.OutputMetadata.Keys.First()].Dimensions;
+            var modelDims = _session.OutputMetadata[outputName].Dimensions;
             long[] outputShape = new long[modelDims.Length];
             long totalSize = 1;
             for (int i = 0; i < modelDims.Length; i++)
@@ -94,27 +118,29 @@ namespace DeepBrainInterface
             }
             _outputBuffer = new float[totalSize];
             _outputOrtValue = OrtValue.CreateTensorValueFromMemory<float>(memInfo, _outputBuffer, outputShape);
-            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
+            _ioBinding.BindOutput(outputName, _outputOrtValue);
 
             _session.RunWithBinding(_runOptions, _ioBinding);
             _currentK = KBelowGate;
         }
 
-        // --- OVERLOADS (Convenience) ---
+        // ==============================================================================
+        // OVERLOADS
+        // ==============================================================================
 
-        // 1. Generic List (Best for 4+ inputs or dynamic arrays)
-        public IObservable<RippleOut> Process(IObservable<IList<Mat>> source)
-        {
-            return ProcessInternal(source.Select(list => new InputPackage { Mats = list, BnoOk = true }));
-        }
-
-        // 2. Single Mat
+        // 1. Single Mat
         public IObservable<RippleOut> Process(IObservable<Mat> source)
         {
             return ProcessInternal(source.Select(m => new InputPackage { Mats = new[] { m }, BnoOk = true }));
         }
 
-        // 3. Tuple (2 Mats) - e.g. Zip output
+        // 2. Mat + BNO Bool
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
+        {
+            return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1 }, BnoOk = t.Item2 }));
+        }
+
+        // 3. Tuple (2 Mats)
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
         {
             return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1, t.Item2 }, BnoOk = true }));
@@ -132,24 +158,27 @@ namespace DeepBrainInterface
             return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1, t.Item2, t.Item3, t.Item4 }, BnoOk = true }));
         }
 
-        // 6. Tuple (2 Mats) + Bool (Signal + Artifact + BNO)
+        // 6. Tuple (2 Mats) + BNO Bool
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
             return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1.Item1, t.Item1.Item2 }, BnoOk = t.Item2 }));
         }
 
-        // 7. Tuple (4 Mats) + Bool (Signal + 3 Artifacts + BNO)
-        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat, Mat, Mat>, bool>> source)
+        // 7. Tuple (3 Mats) + BNO Bool
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat, Mat>, bool>> source)
         {
-            return ProcessInternal(source.Select(t => new InputPackage
-            {
-                Mats = new[] { t.Item1.Item1, t.Item1.Item2, t.Item1.Item3, t.Item1.Item4 },
-                BnoOk = t.Item2
-            }));
+            return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1.Item1, t.Item1.Item2, t.Item1.Item3 }, BnoOk = t.Item2 }));
         }
 
-        // Helper Struct
-        struct InputPackage { public IList<Mat> Mats; public bool BnoOk; }
+        // 8. Tuple (4 Mats) + BNO Bool
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat, Mat, Mat>, bool>> source)
+        {
+            return ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1.Item1, t.Item1.Item2, t.Item1.Item3, t.Item1.Item4 }, BnoOk = t.Item2 }));
+        }
+
+        // ==============================================================================
+        // SHARED LOGIC
+        // ==============================================================================
 
         private IObservable<RippleOut> ProcessInternal(IObservable<InputPackage> source)
         {
@@ -165,31 +194,21 @@ namespace DeepBrainInterface
             {
                 Initialise();
 
-                // 1. INFERENCE (Handles any number of mats up to BatchSize)
+                // 1. INFERENCE
                 float[] results = RunFastInference(input.Mats);
 
                 // 2. EXTRACT SIGNAL & ARTIFACT
-                // Assume Batch 0 = Signal
-                float signalProb = (results.Length > 0) ? results[0] : 0f;
-
-                // Assume Batch 1 = Main Artifact (or Max of remaining batches)
+                float signalProb = results[0]; // Batch 0 is Signal
                 float artifactProb = 0f;
-                if (results.Length > 1)
-                {
-                    // If 4 batches, you might want the MAX of all artifact channels?
-                    // Here we just take Batch 1, or check all subsequent batches
-                    for (int i = 1; i < results.Length; i++)
-                    {
-                        artifactProb = Math.Max(artifactProb, results[i]);
-                    }
-                }
+
+                // Max over remaining batches
+                for (int i = 1; i < results.Length; i++)
+                    artifactProb = Math.Max(artifactProb, results[i]);
 
                 StateMachine.DetectionEnabled = DetectionEnabled;
 
                 // 3. LOGIC
-                // Use Signal from Batch 0 for snapshot
-                Mat signalSnapshot = (input.Mats.Count > 0) ? input.Mats[0] : null;
-                RippleOut output = StateMachine.Update(signalProb, artifactProb, input.BnoOk, signalSnapshot);
+                RippleOut output = StateMachine.Update(signalProb, artifactProb, input.BnoOk, input.Mats[0]);
 
                 // 4. FEEDBACK
                 bool artifactOk = artifactProb < StateMachine.ArtifactThreshold;
@@ -204,7 +223,7 @@ namespace DeepBrainInterface
             });
         }
 
-        private float[] RunFastInference(IList<Mat> mats)
+        private float[] RunFastInference(Mat[] mats)
         {
             // COPY INPUTS
             unsafe
@@ -212,9 +231,7 @@ namespace DeepBrainInterface
                 fixed (float* dstBase = _inputBuffer)
                 {
                     int singleBatchLen = TimePoints * Channels;
-
-                    // Iterate up to BatchSize or InputCount, whichever is smaller
-                    int count = Math.Min(BatchSize, mats.Count);
+                    int count = Math.Min(BatchSize, mats.Length);
 
                     for (int b = 0; b < count; b++)
                     {
@@ -236,7 +253,6 @@ namespace DeepBrainInterface
                     int stride = _outputBuffer.Length / BatchSize;
                     for (int b = 0; b < BatchSize; b++)
                     {
-                        // Grab last timepoint of each batch
                         results[b] = src[(b * stride) + (stride - 1)];
                     }
                 }

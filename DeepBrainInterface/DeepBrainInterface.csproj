@@ -12,7 +12,7 @@
    <PackageTags>Bonsai Rx DeepBrainInterface</PackageTags>
    <TargetFramework>net472</TargetFramework>
    <Features>strict</Features>
-   <Version>0.8.1</Version>
+   <Version>0.8.5</Version>
    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
    <Platforms>AnyCPU;x64</Platforms>
  </PropertyGroup>
