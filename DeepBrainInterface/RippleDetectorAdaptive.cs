@@ -3,9 +3,7 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
@@ -54,34 +52,32 @@ namespace DeepBrainInterface
         public int KAtGate { get; set; } = 1;
 
         // ==============================================================================
-        // INTERNAL RESOURCES
+        // 3. INTERNAL RESOURCES
         // ==============================================================================
-        InferenceSession _session;
-        OrtIoBinding _ioBinding;
-        RunOptions _runOptions;
-        OrtMemoryInfo _memInfo;
+        private InferenceSession _session;
+        private OrtIoBinding _ioBinding;
+        private RunOptions _runOptions;
 
-        // Fixed Pinned Buffers (Allocated Once)
-        float[] _inputBuffer;
-        GCHandle _inputPin;
-        OrtValue _inputOrtValue;
+        // Pinned Buffers
+        private GCHandle _inputPin;
+        private GCHandle _outputPin;
+        private OrtValue _inputOrtValue;
+        private OrtValue _outputOrtValue;
 
-        float[] _outputBuffer;
-        GCHandle _outputPin;
-        OrtValue _outputOrtValue;
+        // Buffers
+        private float[] _outputBuffer;
+        private int _batchStrideFloats;
 
         // Logic State
-        int _strideCounter;
-        int _currentK = 1;
-
-        struct InputPackage { public Mat[] Mats; public bool BnoOk; }
+        private int _strideCounter;
+        private int _currentK = 1;
 
         private void Initialise()
         {
             if (_session != null) return;
             if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
 
-            // A. CONFIGURE SESSION
+            // A. SESSION CONFIG (Strict CPU)
             var opts = new SessionOptions
             {
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
@@ -92,159 +88,185 @@ namespace DeepBrainInterface
                 EnableCpuMemArena = true
             };
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
 
             _session = new InferenceSession(ModelPath, opts);
-            _memInfo = OrtMemoryInfo.DefaultInstance;
             _ioBinding = _session.CreateIoBinding();
             _runOptions = new RunOptions();
 
-            // B. STRICT MEMORY ALLOCATION (Based on BatchSize)
-            int inputLen = BatchSize * TimePoints * Channels;
-            _inputBuffer = new float[inputLen];
-            _inputPin = GCHandle.Alloc(_inputBuffer, GCHandleType.Pinned);
+            // B. SIZE CALCULATIONS
+            _batchStrideFloats = TimePoints * Channels;
+            int totalInputFloats = BatchSize * _batchStrideFloats;
 
-            int outputLen = BatchSize; // [Batch, 1]
-            _outputBuffer = new float[outputLen];
+            // C. PINNED ALLOCATION
+            var inputData = new float[totalInputFloats];
+            _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
+
+            _outputBuffer = new float[BatchSize];
             _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
 
-            // C. BINDING SETUP
-            var inputName = _session.InputMetadata.Keys.First();
-            var outputName = _session.OutputMetadata.Keys.First();
-
-            long[] inShape = new long[] { BatchSize, TimePoints, Channels };
-            long[] outShape = new long[] { BatchSize, 1 };
-
+            // D. BINDING
+            var memInfo = OrtMemoryInfo.DefaultInstance;
             unsafe
             {
                 _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                    _memInfo,
-                    TensorElementType.Float,
-                    inShape,
+                    memInfo, TensorElementType.Float,
+                    new long[] { BatchSize, TimePoints, Channels },
                     _inputPin.AddrOfPinnedObject(),
-                    inputLen * sizeof(float)
+                    totalInputFloats * sizeof(float)
                 );
 
                 _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                    _memInfo,
-                    TensorElementType.Float,
-                    outShape,
+                    memInfo, TensorElementType.Float,
+                    new long[] { BatchSize, 1 },
                     _outputPin.AddrOfPinnedObject(),
-                    outputLen * sizeof(float)
+                    _outputBuffer.Length * sizeof(float)
                 );
             }
 
-            _ioBinding.BindInput(inputName, _inputOrtValue);
-            _ioBinding.BindOutput(outputName, _outputOrtValue);
+            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
+            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
 
             // Warmup
             _session.RunWithBinding(_runOptions, _ioBinding);
         }
 
-        private IObservable<RippleOut> ProcessInternal(IObservable<InputPackage> source)
+        // ==============================================================================
+        // 4. PROCESSING LOGIC
+        // ==============================================================================
+
+        // --- BATCH 2 OVERLOADS ---
+
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
         {
-            return source.Where(input =>
-            {
-                // STRIDE GATE
-                if (_currentK <= 1) return true;
-                _strideCounter++;
-                if (_strideCounter >= _currentK)
-                {
-                    _strideCounter = 0;
-                    return true;
-                }
-                return false;
-            })
-            .Select(input =>
-            {
-                Initialise();
-
-                // Safety: Ensure we received exactly what we configured
-                if (input.Mats.Length != BatchSize)
-                    throw new InvalidOperationException($"Input mismatch: Received {input.Mats.Length} mats, expected BatchSize {BatchSize}");
-
-                // 1. FAST COPY (Mat -> Pinned Buffer)
-                unsafe
-                {
-                    float* dstBase = (float*)_inputPin.AddrOfPinnedObject().ToPointer();
-                    int stride = TimePoints * Channels;
-                    long bytesPerMat = stride * sizeof(float);
-
-                    for (int i = 0; i < BatchSize; i++)
-                    {
-                        float* src = (float*)input.Mats[i].Data.ToPointer();
-                        float* dst = dstBase + (i * stride);
-
-                        // Layout Check
-                        if (input.Mats[i].Rows == TimePoints && input.Mats[i].Cols == Channels)
-                        {
-                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
-                        }
-                        else if (input.Mats[i].Rows == Channels && input.Mats[i].Cols == TimePoints)
-                        {
-                            // Transpose
-                            for (int c = 0; c < Channels; c++)
-                            {
-                                int cOff = c * TimePoints;
-                                for (int t = 0; t < TimePoints; t++)
-                                {
-                                    dst[t * Channels + c] = src[cOff + t];
-                                }
-                            }
-                        }
-                        else
-                        {
-                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
-                        }
-                    }
-                }
-
-                // 2. INFERENCE
-                _session.RunWithBinding(_runOptions, _ioBinding);
-
-                // 3. READ OUTPUTS (Strict Logic)
-                float signalProb = _outputBuffer[0];
-                float artifactProb = 0f;
-
-                if (BatchSize >= 2)
-                {
-                    artifactProb = _outputBuffer[1];
-                }
-
-                // 4. LOGIC UPDATE
-                RippleOut output = StateMachine.Update(signalProb, artifactProb, input.BnoOk, input.Mats[0]);
-
-                // 5. ADAPT STRIDE
-                if (output.State != RippleState.NoRipple) _currentK = KAtGate;
-                else _currentK = KBelowGate;
-
-                output.StrideUsed = _currentK;
-                return output;
-            });
+            return source.Where(_ => CheckStride()).Select(t => RunBatch2(t.Item1, t.Item2, true));
         }
 
-        // --- OVERLOADS ---
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
+        {
+            return source.Where(_ => CheckStride()).Select(t => RunBatch2(t.Item1.Item1, t.Item1.Item2, t.Item2));
+        }
 
-        // BatchSize = 1
+        // --- BATCH 1 OVERLOADS ---
+
         public IObservable<RippleOut> Process(IObservable<Mat> source)
-            => ProcessInternal(source.Select(m => new InputPackage { Mats = new[] { m }, BnoOk = true }));
+        {
+            return source.Where(_ => CheckStride()).Select(m => RunBatch1(m, true));
+        }
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
-            => ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1 }, BnoOk = t.Item2 }));
+        {
+            return source.Where(_ => CheckStride()).Select(t => RunBatch1(t.Item1, t.Item2));
+        }
 
-        // BatchSize = 2
-        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
-            => ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1, t.Item2 }, BnoOk = true }));
 
-        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
-            => ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1.Item1, t.Item1.Item2 }, BnoOk = t.Item2 }));
+        // ==============================================================================
+        // 5. CORE EXECUTION
+        // ==============================================================================
 
+        private bool CheckStride()
+        {
+            // If K=1, always run. If K>1, skip (K-1) frames.
+            if (_currentK <= 1) return true;
+
+            _strideCounter++;
+            if (_strideCounter >= _currentK)
+            {
+                _strideCounter = 0;
+                return true;
+            }
+            return false;
+        }
+
+        private RippleOut RunBatch2(Mat signal, Mat artifact, bool bnoOk)
+        {
+            Initialise();
+            if (BatchSize != 2) throw new InvalidOperationException("Adaptive Config is Batch 2, but received Batch 1.");
+
+            unsafe
+            {
+                float* ptr = (float*)_inputPin.AddrOfPinnedObject();
+                RobustTransposeCopy(signal, ptr);
+                RobustTransposeCopy(artifact, ptr + _batchStrideFloats);
+            }
+
+            _session.RunWithBinding(_runOptions, _ioBinding);
+
+            // Read Output Directly from Pinned Buffer
+            float sigProb = _outputBuffer[0];
+            float artProb = _outputBuffer[1];
+
+            return UpdateState(sigProb, artProb, bnoOk, signal);
+        }
+
+        private RippleOut RunBatch1(Mat signal, bool bnoOk)
+        {
+            Initialise();
+            if (BatchSize != 1) throw new InvalidOperationException("Adaptive Config is Batch 1, but received Batch 2.");
+
+            unsafe
+            {
+                RobustTransposeCopy(signal, (float*)_inputPin.AddrOfPinnedObject());
+            }
+
+            _session.RunWithBinding(_runOptions, _ioBinding);
+
+            // Read Output
+            float sigProb = _outputBuffer[0];
+
+            return UpdateState(sigProb, 0f, bnoOk, signal);
+        }
+
+        private RippleOut UpdateState(float sigP, float artP, bool bnoOk, Mat displayMat)
+        {
+            // Update State Machine
+            var result = StateMachine.Update(sigP, artP, bnoOk, displayMat);
+
+            // ADAPTIVE LOGIC:
+            // If we are in a Ripple or Candidate state, we go FAST (K=1).
+            // If we are in NoRipple state, we go SLOW (K=5 or user defined).
+            if (result.State != RippleState.NoRipple)
+                _currentK = KAtGate;
+            else
+                _currentK = KBelowGate;
+
+            result.StrideUsed = _currentK;
+            return result;
+        }
+
+        // ==============================================================================
+        // 6. ROBUST MEMORY OPS
+        // ==============================================================================
+
+        private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
+        {
+            if (src.Rows != Channels || src.Cols != TimePoints)
+                throw new InvalidOperationException($"Input must be {Channels}x{TimePoints}. Got {src.Rows}x{src.Cols}");
+
+            byte* srcRowPtr = (byte*)src.Data.ToPointer();
+            int srcStep = src.Step;
+
+            for (int c = 0; c < Channels; c++)
+            {
+                float* srcFloatRow = (float*)srcRowPtr;
+                for (int t = 0; t < TimePoints; t++)
+                {
+                    dstBase[t * Channels + c] = srcFloatRow[t];
+                }
+                srcRowPtr += srcStep;
+            }
+        }
 
         public void Unload()
         {
-            _inputOrtValue?.Dispose(); _outputOrtValue?.Dispose();
+            _inputOrtValue?.Dispose();
+            _outputOrtValue?.Dispose();
             if (_inputPin.IsAllocated) _inputPin.Free();
             if (_outputPin.IsAllocated) _outputPin.Free();
-            _ioBinding?.Dispose(); _runOptions?.Dispose(); _session?.Dispose();
+            _ioBinding?.Dispose();
+            _runOptions?.Dispose();
+            _session?.Dispose();
+            _session = null;
         }
     }
 }

@@ -3,7 +3,6 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
@@ -17,40 +16,38 @@ namespace DeepBrainInterface
     public enum OnnxProvider { Cpu, Cuda, TensorRT }
 
     [Combinator]
-    [Description("High-Performance GPU Inference (Strict Batch 1 or 2, Pinned Memory, Tunable Threading).")]
+    [Description("High-Performance GPU Inference (Strict Batch 1 or 2, Pinned Memory).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorGPU
     {
         // ==============================================================================
-        // 1. CONFIGURATION
+        // 1. MODEL CONFIGURATION
         // ==============================================================================
         [Category("Model")]
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
         [Category("Model")]
-        [Description("Strictly 1 (Signal only) or 2 (Signal + Artifact).")]
+        [Description("Strictly 1 (Signal) or 2 (Signal + Artifact).")]
         public int BatchSize { get; set; } = 2;
 
-        [Category("Model")]
-        public int TimePoints { get; set; } = 92;
+        [Category("Data Dimensions")]
+        public int TimePoints { get; set; } = 44;
 
-        [Category("Model")]
+        [Category("Data Dimensions")]
         public int Channels { get; set; } = 8;
 
         // ==============================================================================
         // 2. GPU & THREADING
         // ==============================================================================
         [Category("Execution Provider")]
-        [Description("Select Hardware Accelerator.")]
         public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
 
         [Category("Execution Provider")]
-        [Description("GPU Device ID (Default 0).")]
         public int DeviceId { get; set; } = 0;
 
         [Category("Threading")]
-        [Description("Threads for single-op calculation (MatMul). Increase for large batches.")]
+        [Description("Threads for single-op calculation (MatMul).")]
         public int IntraOpNumThreads { get; set; } = 1;
 
         [Category("Threading")]
@@ -58,30 +55,28 @@ namespace DeepBrainInterface
         public int InterOpNumThreads { get; set; } = 1;
 
         // ==============================================================================
-        // INTERNAL RESOURCES
+        // 3. INTERNAL RESOURCES
         // ==============================================================================
-        InferenceSession _session;
-        OrtIoBinding _ioBinding;
-        RunOptions _runOptions;
-        OrtMemoryInfo _memInfo;
+        private InferenceSession _session;
+        private OrtIoBinding _ioBinding;
+        private RunOptions _runOptions;
 
-        // Fixed Pinned Buffers
-        float[] _inputBuffer;
-        GCHandle _inputPin;
-        OrtValue _inputOrtValue;
+        // Pinned Memory
+        private GCHandle _inputPin;
+        private GCHandle _outputPin;
+        private OrtValue _inputOrtValue;
+        private OrtValue _outputOrtValue;
 
-        float[] _outputBuffer;
-        GCHandle _outputPin;
-        OrtValue _outputOrtValue;
-
-        struct InputPackage { public Mat[] Mats; }
+        // Buffers
+        private float[] _outputBuffer;
+        private int _batchStrideFloats;
 
         private void Initialise()
         {
             if (_session != null) return;
             if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
 
-            // 1. CONFIGURE SESSION OPTIONS
+            // A. SESSION CONFIG (GPU Logic)
             var opts = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
@@ -91,17 +86,20 @@ namespace DeepBrainInterface
                 InterOpNumThreads = InterOpNumThreads
             };
 
-            // 2. CONFIGURE GPU PROVIDERS (Robust Fallback Logic)
+            // Set Environment Vars for TensorRT (If selected)
+            if (Provider == OnnxProvider.TensorRT)
+            {
+                string cacheDir = Path.GetDirectoryName(Path.GetFullPath(ModelPath));
+                Environment.SetEnvironmentVariable("ORT_TENSORRT_FP16_ENABLE", "1");
+                Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_ENABLE", "1");
+                Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_PATH", cacheDir);
+            }
+
+            // Append Providers
             try
             {
                 if (Provider == OnnxProvider.TensorRT)
                 {
-                    // TensorRT Setup via Environment Variables (Fixes API compatibility)
-                    string cacheDir = Path.GetDirectoryName(ModelPath);
-                    Environment.SetEnvironmentVariable("ORT_TENSORRT_FP16_ENABLE", "1");
-                    Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_ENABLE", "1");
-                    Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_PATH", cacheDir);
-
                     opts.AppendExecutionProvider_Tensorrt(DeviceId);
                     opts.AppendExecutionProvider_CUDA(DeviceId); // Fallback
                 }
@@ -112,139 +110,145 @@ namespace DeepBrainInterface
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GPU Error] {ex.Message}. Falling back to CPU.");
-                Provider = OnnxProvider.Cpu;
+                Console.WriteLine($"[GPU Init Failed] {ex.Message}. Falling back to CPU.");
             }
 
-            // 3. CREATE SESSION
+            // Create Session
             _session = new InferenceSession(ModelPath, opts);
-
-            // NOTE: Even for GPU, we use CPU memory for the binding source. 
-            // ONNX Runtime handles the DMA transfer to GPU automatically.
-            _memInfo = OrtMemoryInfo.DefaultInstance;
-
             _ioBinding = _session.CreateIoBinding();
             _runOptions = new RunOptions();
 
-            // 4. STRICT MEMORY ALLOCATION
-            int inputLen = BatchSize * TimePoints * Channels;
-            _inputBuffer = new float[inputLen];
-            _inputPin = GCHandle.Alloc(_inputBuffer, GCHandleType.Pinned);
+            // B. SIZE CALCULATION
+            _batchStrideFloats = TimePoints * Channels;
+            int totalInputFloats = BatchSize * _batchStrideFloats;
 
-            int outputLen = BatchSize; // [Batch, 1]
-            _outputBuffer = new float[outputLen];
+            // C. ALLOCATE PINNED MEMORY
+            var inputData = new float[totalInputFloats];
+            _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
+
+            // FIX: Uses BatchSize directly (removed undefined 'outLen')
+            _outputBuffer = new float[BatchSize];
             _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
 
-            // 5. BINDING SETUP
-            var inputName = _session.InputMetadata.Keys.First();
-            var outputName = _session.OutputMetadata.Keys.First();
-
-            long[] inShape = new long[] { BatchSize, TimePoints, Channels };
-            long[] outShape = new long[] { BatchSize, 1 };
-
+            // D. BIND TENSORS (Zero-Copy)
+            var memInfo = OrtMemoryInfo.DefaultInstance; // CPU Pinned Memory -> DMA to GPU
             unsafe
             {
                 _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                    _memInfo,
-                    TensorElementType.Float,
-                    inShape,
+                    memInfo, TensorElementType.Float,
+                    new long[] { BatchSize, TimePoints, Channels },
                     _inputPin.AddrOfPinnedObject(),
-                    inputLen * sizeof(float)
+                    totalInputFloats * sizeof(float)
                 );
 
                 _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                    _memInfo,
-                    TensorElementType.Float,
-                    outShape,
+                    memInfo, TensorElementType.Float,
+                    new long[] { BatchSize, 1 },
                     _outputPin.AddrOfPinnedObject(),
-                    outputLen * sizeof(float)
+                    _outputBuffer.Length * sizeof(float)
                 );
             }
 
-            _ioBinding.BindInput(inputName, _inputOrtValue);
-            _ioBinding.BindOutput(outputName, _outputOrtValue);
+            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
+            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
 
-            // Warmup Run
+            // Warmup
             _session.RunWithBinding(_runOptions, _ioBinding);
         }
 
-        private IObservable<Mat> ProcessInternal(IObservable<InputPackage> source)
+        // ==============================================================================
+        // 4. PROCESSING (Optimized & Robust)
+        // ==============================================================================
+
+        // Scenario: Batch 2 (Signal + Artifact)
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
         {
             return source.Select(input =>
             {
                 Initialise();
+                if (BatchSize != 2) throw new InvalidOperationException("GPU Config is Batch 2, but received Tuple.");
 
-                // Safety Check
-                if (input.Mats.Length != BatchSize)
-                    throw new InvalidOperationException($"Input count {input.Mats.Length} does not match BatchSize {BatchSize}");
-
-                // 1. FAST COPY (Mat -> Pinned Buffer)
                 unsafe
                 {
-                    float* dstBase = (float*)_inputPin.AddrOfPinnedObject().ToPointer();
-                    int stride = TimePoints * Channels;
-                    long bytesPerMat = stride * sizeof(float);
+                    float* ptr = (float*)_inputPin.AddrOfPinnedObject();
 
-                    for (int i = 0; i < BatchSize; i++)
-                    {
-                        float* src = (float*)input.Mats[i].Data.ToPointer();
-                        float* dst = dstBase + (i * stride);
+                    // 1. Transpose Signal -> Index 0
+                    RobustTransposeCopy(input.Item1, ptr);
 
-                        // Layout Check
-                        if (input.Mats[i].Rows == TimePoints && input.Mats[i].Cols == Channels)
-                        {
-                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
-                        }
-                        else if (input.Mats[i].Rows == Channels && input.Mats[i].Cols == TimePoints)
-                        {
-                            // Transpose
-                            for (int c = 0; c < Channels; c++)
-                            {
-                                int cOff = c * TimePoints;
-                                for (int t = 0; t < TimePoints; t++)
-                                {
-                                    dst[t * Channels + c] = src[cOff + t];
-                                }
-                            }
-                        }
-                        else
-                        {
-                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
-                        }
-                    }
+                    // 2. Transpose Artifact -> Index [Stride]
+                    RobustTransposeCopy(input.Item2, ptr + _batchStrideFloats);
                 }
 
-                // 2. INFERENCE
-                // Data transfers from Pinned CPU RAM -> GPU VRAM -> Compute -> GPU VRAM -> Pinned CPU RAM
-                // This happens automatically inside RunWithBinding
-                _session.RunWithBinding(_runOptions, _ioBinding);
-
-                // 3. RETURN RESULT
-                var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
-                unsafe
-                {
-                    float* dst = (float*)outMat.Data.ToPointer();
-                    Marshal.Copy(_outputBuffer, 0, (IntPtr)dst, BatchSize);
-                }
-
-                return outMat;
+                return RunInference();
             });
         }
 
-        // --- PIPELINE OVERLOADS ---
-
+        // Scenario: Batch 1 (Signal Only)
         public IObservable<Mat> Process(IObservable<Mat> source)
-            => ProcessInternal(source.Select(m => new InputPackage { Mats = new[] { m } }));
+        {
+            return source.Select(input =>
+            {
+                Initialise();
+                if (BatchSize != 1) throw new InvalidOperationException("GPU Config is Batch 1, but received Single Mat.");
 
-        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
-            => ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1, t.Item2 } }));
+                unsafe
+                {
+                    RobustTransposeCopy(input, (float*)_inputPin.AddrOfPinnedObject());
+                }
+
+                return RunInference();
+            });
+        }
+
+        // ==============================================================================
+        // 5. CORE LOGIC
+        // ==============================================================================
+
+        // Hardcoded Transpose: 8x44 (Input) -> 44x8 (Model)
+        private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
+        {
+            if (src.Rows != Channels || src.Cols != TimePoints)
+                throw new InvalidOperationException($"Input must be {Channels}x{TimePoints}. Got {src.Rows}x{src.Cols}");
+
+            byte* srcRowPtr = (byte*)src.Data.ToPointer();
+            int srcStep = src.Step; // Handles Padding/ROI
+
+            for (int c = 0; c < Channels; c++)
+            {
+                float* srcFloatRow = (float*)srcRowPtr;
+                for (int t = 0; t < TimePoints; t++)
+                {
+                    // Map [Channel, Time] -> [Time, Channel]
+                    dstBase[t * Channels + c] = srcFloatRow[t];
+                }
+                srcRowPtr += srcStep;
+            }
+        }
+
+        private Mat RunInference()
+        {
+            // 1. Execute on GPU (Data auto-transfers via Binding)
+            _session.RunWithBinding(_runOptions, _ioBinding);
+
+            // 2. Return Result
+            var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
+            unsafe
+            {
+                Marshal.Copy(_outputBuffer, 0, outMat.Data, BatchSize);
+            }
+            return outMat;
+        }
 
         public void Unload()
         {
-            _inputOrtValue?.Dispose(); _outputOrtValue?.Dispose();
+            _inputOrtValue?.Dispose();
+            _outputOrtValue?.Dispose();
             if (_inputPin.IsAllocated) _inputPin.Free();
             if (_outputPin.IsAllocated) _outputPin.Free();
-            _ioBinding?.Dispose(); _runOptions?.Dispose(); _session?.Dispose();
+            _ioBinding?.Dispose();
+            _runOptions?.Dispose();
+            _session?.Dispose();
+            _session = null;
         }
     }
 }
