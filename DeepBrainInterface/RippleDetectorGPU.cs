@@ -10,26 +10,24 @@ using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Drawing.Design;
 using System.Windows.Forms.Design;
-using System.Diagnostics; // Added for Stopwatch
+using System.Diagnostics;
+using System.Runtime;
 
 namespace DeepBrainInterface
 {
     public enum OnnxProvider { Cpu, Cuda, TensorRT }
 
     [Combinator]
-    [Description("High-Performance GPU Inference (Strict Batch 1 or 2, Pinned Memory).")]
+    [Description("High-Performance GPU Inference (Zero-Allocation Loop).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorGPU
     {
-        // ==============================================================================
-        // 1. MODEL CONFIGURATION
-        // ==============================================================================
+        // ... (Configuration properties same as before) ...
         [Category("Model")]
         [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
         [Category("Model")]
-        [Description("Strictly 1 (Signal) or 2 (Signal + Artifact).")]
         public int BatchSize { get; set; } = 2;
 
         [Category("Data Dimensions")]
@@ -38,9 +36,6 @@ namespace DeepBrainInterface
         [Category("Data Dimensions")]
         public int Channels { get; set; } = 8;
 
-        // ==============================================================================
-        // 2. GPU & THREADING
-        // ==============================================================================
         [Category("Execution Provider")]
         public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
 
@@ -48,39 +43,45 @@ namespace DeepBrainInterface
         public int DeviceId { get; set; } = 0;
 
         [Category("Threading")]
-        [Description("Threads for single-op calculation (MatMul).")]
         public int IntraOpNumThreads { get; set; } = 1;
 
         [Category("Threading")]
-        [Description("Threads for parallel sub-graphs.")]
         public int InterOpNumThreads { get; set; } = 1;
 
-        // ==============================================================================
-        // 3. INTERNAL RESOURCES
-        // ==============================================================================
+        // ... Resources ...
         private InferenceSession _session;
         private OrtIoBinding _ioBinding;
         private RunOptions _runOptions;
+        private Stopwatch _benchmarker = new Stopwatch();
 
-        // Benchmarking
-        private Stopwatch _benchmarker = new Stopwatch(); // Added
-
-        // Pinned Memory
+        // Memory Resources
         private GCHandle _inputPin;
         private GCHandle _outputPin;
         private OrtValue _inputOrtValue;
         private OrtValue _outputOrtValue;
+        private float[] _outputBuffer; // The raw pinned memory for ONNX
 
-        // Buffers
-        private float[] _outputBuffer;
+        // NEW: The reusable container for Bonsai
+        private Mat _reusableOutputMat;
+
         private int _batchStrideFloats;
+
+        // Optimization: Track GC to prove spikes
+        private int _lastGcCount = 0;
 
         private void Initialise()
         {
             if (_session != null) return;
-            if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
 
-            // A. SESSION CONFIG (GPU Logic)
+            // 1. System Priority (Crucial for <1ms stability)
+            try
+            {
+                Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+            }
+            catch (Exception ex) { Console.WriteLine(ex.Message); }
+
+            // 2. ONNX Config
             var opts = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
@@ -90,7 +91,6 @@ namespace DeepBrainInterface
                 InterOpNumThreads = InterOpNumThreads
             };
 
-            // Set Environment Vars for TensorRT (If selected)
             if (Provider == OnnxProvider.TensorRT)
             {
                 string cacheDir = Path.GetDirectoryName(Path.GetFullPath(ModelPath));
@@ -99,43 +99,37 @@ namespace DeepBrainInterface
                 Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_PATH", cacheDir);
             }
 
-            // Append Providers
             try
             {
                 if (Provider == OnnxProvider.TensorRT)
                 {
                     opts.AppendExecutionProvider_Tensorrt(DeviceId);
-                    opts.AppendExecutionProvider_CUDA(DeviceId); // Fallback
-                }
-                else if (Provider == OnnxProvider.Cuda)
-                {
                     opts.AppendExecutionProvider_CUDA(DeviceId);
                 }
+                else if (Provider == OnnxProvider.Cuda) opts.AppendExecutionProvider_CUDA(DeviceId);
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[GPU Init Failed] {ex.Message}. Falling back to CPU.");
-            }
+            catch (Exception ex) { Console.WriteLine($"[GPU Init Failed] {ex.Message}"); }
 
-            // Create Session
             _session = new InferenceSession(ModelPath, opts);
             _ioBinding = _session.CreateIoBinding();
             _runOptions = new RunOptions();
 
-            // B. SIZE CALCULATION
+            // 3. Allocations (DONE EXACTLY ONCE)
             _batchStrideFloats = TimePoints * Channels;
             int totalInputFloats = BatchSize * _batchStrideFloats;
 
-            // C. ALLOCATE PINNED MEMORY
             var inputData = new float[totalInputFloats];
             _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
 
-            // FIX: Uses BatchSize directly (removed undefined 'outLen')
             _outputBuffer = new float[BatchSize];
             _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
 
-            // D. BIND TENSORS (Zero-Copy)
-            var memInfo = OrtMemoryInfo.DefaultInstance; // CPU Pinned Memory -> DMA to GPU
+            // PRE-ALLOCATE THE OUTPUT MAT
+            // We will never create a new Mat() after this line.
+            _reusableOutputMat = new Mat(BatchSize, 1, Depth.F32, 1);
+
+            // Bindings
+            var memInfo = OrtMemoryInfo.DefaultInstance;
             unsafe
             {
                 _inputOrtValue = OrtValue.CreateTensorValueWithData(
@@ -160,69 +154,43 @@ namespace DeepBrainInterface
             _session.RunWithBinding(_runOptions, _ioBinding);
         }
 
-        // ==============================================================================
-        // 4. PROCESSING (Optimized & Robust)
-        // ==============================================================================
-
-        // Scenario: Batch 2 (Signal + Artifact)
         public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
         {
             return source.Select(input =>
             {
                 Initialise();
-                if (BatchSize != 2) throw new InvalidOperationException("GPU Config is Batch 2, but received Tuple.");
-
                 unsafe
                 {
                     float* ptr = (float*)_inputPin.AddrOfPinnedObject();
-
-                    // 1. Transpose Signal -> Index 0
                     RobustTransposeCopy(input.Item1, ptr);
-
-                    // 2. Transpose Artifact -> Index [Stride]
                     RobustTransposeCopy(input.Item2, ptr + _batchStrideFloats);
                 }
-
                 return RunInference();
             });
         }
 
-        // Scenario: Batch 1 (Signal Only)
         public IObservable<Mat> Process(IObservable<Mat> source)
         {
             return source.Select(input =>
             {
                 Initialise();
-                if (BatchSize != 1) throw new InvalidOperationException("GPU Config is Batch 1, but received Single Mat.");
-
                 unsafe
                 {
                     RobustTransposeCopy(input, (float*)_inputPin.AddrOfPinnedObject());
                 }
-
                 return RunInference();
             });
         }
 
-        // ==============================================================================
-        // 5. CORE LOGIC
-        // ==============================================================================
-
-        // Hardcoded Transpose: 8x44 (Input) -> 44x8 (Model)
         private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
         {
-            if (src.Rows != Channels || src.Cols != TimePoints)
-                throw new InvalidOperationException($"Input must be {Channels}x{TimePoints}. Got {src.Rows}x{src.Cols}");
-
             byte* srcRowPtr = (byte*)src.Data.ToPointer();
-            int srcStep = src.Step; // Handles Padding/ROI
-
+            int srcStep = src.Step;
             for (int c = 0; c < Channels; c++)
             {
                 float* srcFloatRow = (float*)srcRowPtr;
                 for (int t = 0; t < TimePoints; t++)
                 {
-                    // Map [Channel, Time] -> [Time, Channel]
                     dstBase[t * Channels + c] = srcFloatRow[t];
                 }
                 srcRowPtr += srcStep;
@@ -231,29 +199,40 @@ namespace DeepBrainInterface
 
         private Mat RunInference()
         {
-            // Start Timer
+            // 1. Snapshot GC State
+            int currentGcCount = GC.CollectionCount(0);
+            bool gcHappened = currentGcCount > _lastGcCount;
+            _lastGcCount = currentGcCount;
+
             _benchmarker.Restart();
 
-            // 1. Execute on GPU (Data auto-transfers via Binding)
+            // 2. Run ONNX (Writes directly to _outputBuffer via IoBinding)
             _session.RunWithBinding(_runOptions, _ioBinding);
 
-            // Stop Timer
-            _benchmarker.Stop();
-
-            // Log Time (Check Bonsai Console Window)
-            Console.WriteLine($"Inference: {_benchmarker.Elapsed.TotalMilliseconds:F4} ms | Provider: {Provider}");
-
-            // 2. Return Result
-            var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
+            // 3. Update the Reusable Mat
+            // Use Marshal.Copy to move data from the pinned float[] to the Mat's internal pointer.
+            // This is a memory-to-memory copy of ~1KB (negligible time) but avoids object creation.
             unsafe
             {
-                Marshal.Copy(_outputBuffer, 0, outMat.Data, BatchSize);
+                Marshal.Copy(_outputBuffer, 0, _reusableOutputMat.Data, BatchSize);
             }
-            return outMat;
+
+            _benchmarker.Stop();
+
+            // 4. Smart Logging (Only print spikes)
+            if (gcHappened || _benchmarker.Elapsed.TotalMilliseconds > 1.0)
+            {
+                string log = $"SPIKE: {_benchmarker.Elapsed.TotalMilliseconds:F4} ms";
+                if (gcHappened) log += " <--- *** GARBAGE COLLECTION ***";
+                Console.WriteLine(log);
+            }
+
+            return _reusableOutputMat;
         }
 
         public void Unload()
         {
+            _reusableOutputMat?.Dispose();
             _inputOrtValue?.Dispose();
             _outputOrtValue?.Dispose();
             if (_inputPin.IsAllocated) _inputPin.Free();
