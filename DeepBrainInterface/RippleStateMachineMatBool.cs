@@ -17,164 +17,120 @@ namespace DeepBrainInterface
         public float ArtifactProbability { get; set; }
         public int StrideUsed { get; set; }
         public int EventCount { get; set; }
-
         public float Score { get; set; }
         public float LastEventScore { get; set; }
 
-        public bool EventPulse { get; set; }   // True only for 1 frame when trigger fires
+        // Outputs
+        public bool EventPulse { get; set; }   // Single frame High on detection
         public bool TriggerPulse { get; set; } // Same as EventPulse
-        public bool TTL { get; set; }          // True during the "Hold" phase
+        public bool TTL { get; set; }          // High during Hold Duration
 
-        public Mat TriggerData { get; set; }
+        public Mat TriggerData { get; set; }   // Snapshot of the input (if provided)
     }
 
     [Combinator]
-    [Description("Logic Engine: Probability + Artifact + BNO Gate → RippleState.")]
+    [Description("Logic Engine: Probability Mat -> RippleState (with optional gating).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public sealed class RippleStateMachineMatBool
     {
-        // ---- General ----
-        [Category("General"), DisplayName("Detection Enabled")]
-        public bool DetectionEnabled { get; set; } = true;
+        // ==============================================================================
+        // 1. PARAMETERS
+        // ==============================================================================
+        [Category("General"), DisplayName("Detection Enabled")] public bool DetectionEnabled { get; set; } = true;
+        [Category("General"), DisplayName("Artifact Threshold")] public float ArtifactThreshold { get; set; } = 0.5f;
 
-        [Category("General"), DisplayName("Artifact Threshold")]
-        public float ArtifactThreshold { get; set; } = 0.5f;
+        [Category("Thresholds"), DisplayName("1. Gate (arm)")] public float GateThreshold { get; set; } = 0.10f;
+        [Category("Thresholds"), DisplayName("2. Enter (+0.5)")] public float EnterThreshold { get; set; } = 0.50f;
+        [Category("Thresholds"), DisplayName("3. Confirm (+1.0)")] public float ConfirmThreshold { get; set; } = 0.80f;
+        [Category("Thresholds"), DisplayName("4. Event Score")] public float EventScoreThreshold { get; set; } = 2.5f;
+        [Category("Thresholds"), DisplayName("5. Decay Rate")] public float DecayRate { get; set; } = 1.0f;
+        [Category("Thresholds"), DisplayName("6. Decay Grace")] public int DecayGraceTicks { get; set; } = 5;
 
-        // ---- Thresholds ----
-        [Category("Thresholds"), DisplayName("1. Gate (arm)")]
-        public float GateThreshold { get; set; } = 0.10f;
+        [Category("TTL"), DisplayName("Trigger Delay (ms)")] public int TriggerDelayMs { get; set; } = 0;
+        [Category("TTL"), DisplayName("PostRipple Hold (ms)")] public int PostRippleMs { get; set; } = 50;
 
-        [Category("Thresholds"), DisplayName("2. Enter (+0.5 per tick)")]
-        public float EnterThreshold { get; set; } = 0.50f;
-
-        [Category("Thresholds"), DisplayName("3. Confirm (+1.0 per tick)")]
-        public float ConfirmThreshold { get; set; } = 0.80f;
-
-        [Category("Thresholds"), DisplayName("4. Event Score (≥ triggers)")]
-        public float EventScoreThreshold { get; set; } = 2.5f;
-
-        [Category("Thresholds"), DisplayName("5. Decay Rate")]
-        public float DecayRate { get; set; } = 1.0f;
-
-        [Category("Thresholds"), DisplayName("6. Decay Grace (ticks)")]
-        public int DecayGraceTicks { get; set; } = 5;
-
-        // ---- Timing ----
-        [Category("TTL"), DisplayName("Trigger Delay (ms)")]
-        [Description("Wait time AFTER detection before setting TTL High.")]
-        public int TriggerDelayMs { get; set; } = 0;
-
-        [Category("TTL"), DisplayName("PostRipple Hold (ms)")]
-        [Description("Duration TTL stays High after the delay finishes.")]
-        public int PostRippleMs { get; set; } = 50;
-
-        // ---- Internal ----
+        // ==============================================================================
+        // 2. INTERNAL STATE
+        // ==============================================================================
         RippleState _state = RippleState.NoRipple;
         float _scoreTicks;
         int _eventCount;
         float _lastEventScore;
         int _ticksInPossible;
 
-        bool _ttlArmed;         // Waiting for the Delay
-        long _ttlAtMs;          // Target time to fire
-        bool _ttlHolding;       // TTL is High
-        long _ttlHoldUntilMs;   // Target time to drop TTL
-
+        // Trigger Logic
+        bool _ttlArmed; long _ttlAtMs;
+        bool _ttlHolding; long _ttlHoldUntilMs;
         static readonly Stopwatch Clock = Stopwatch.StartNew();
 
+        // ==============================================================================
+        // 3. CORE LOGIC
+        // ==============================================================================
         public RippleOut Update(float signal, float artifact, bool bnoOk, Mat rawInput)
         {
             long now = Clock.ElapsedMilliseconds;
             bool triggerFrame = false;
             Mat triggerSnapshot = null;
 
-            // ---------------------------------------------------------
-            // 1. POST-RIPPLE HOLD (TTL = HIGH)
-            // ---------------------------------------------------------
-            // If we are holding, we block everything else.
+            // A. HOLD PHASE (Refractory)
             if (_ttlHolding)
             {
                 if (now >= _ttlHoldUntilMs)
                 {
-                    // Hold finished. Reset.
                     _ttlHolding = false;
                     _state = RippleState.NoRipple;
                     _scoreTicks = 0;
                     _ticksInPossible = 0;
                 }
-                else
-                {
-                    // Still holding. TTL is TRUE.
-                    return Pack(signal, artifact, false, true, null);
-                }
+                else return Pack(signal, artifact, false, true, null);
             }
 
-            // ---------------------------------------------------------
-            // 2. TRIGGER DELAY (TTL = LOW)
-            // ---------------------------------------------------------
-            // If armed, we wait. We ignore signal drops (latched).
+            // B. DELAY PHASE (Latched Wait)
             if (_ttlArmed)
             {
                 if (now >= _ttlAtMs)
                 {
-                    // Delay finished. FIRE.
+                    // Delay Over -> FIRE
                     _ttlArmed = false;
-
                     _ttlHolding = true;
-                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs); // Ensure non-zero hold
+                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
 
                     triggerFrame = true;
                     triggerSnapshot = rawInput?.Clone();
 
-                    // Pulse = True, TTL = True
                     return Pack(signal, artifact, true, true, triggerSnapshot);
                 }
-
-                // Still waiting. TTL is FALSE.
+                // Waiting... (TTL Low)
                 return Pack(signal, artifact, false, false, null);
             }
 
-            // ---------------------------------------------------------
-            // 3. GATING (Input Validation)
-            // ---------------------------------------------------------
+            // C. GATING (Input Validation)
             bool artifactOk = artifact < ArtifactThreshold;
             bool gatesOn = DetectionEnabled && bnoOk && artifactOk;
 
             if (!gatesOn)
             {
-                _state = RippleState.NoRipple;
-                _scoreTicks = 0;
-                _ticksInPossible = 0;
+                _state = RippleState.NoRipple; _scoreTicks = 0; _ticksInPossible = 0;
                 return Pack(signal, artifact, false, false, null);
             }
 
-            // ---------------------------------------------------------
-            // 4. DETECTION FSM
-            // ---------------------------------------------------------
+            // D. FINITE STATE MACHINE
             float eventTicksTarget = EventScoreThreshold * 2.0f;
-
             switch (_state)
             {
                 case RippleState.NoRipple:
-                    if (signal >= GateThreshold)
-                    {
-                        _state = RippleState.Possible;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
-                    }
+                    if (signal >= GateThreshold) { _state = RippleState.Possible; _scoreTicks = 0; _ticksInPossible = 0; }
                     break;
 
                 case RippleState.Possible:
                     _ticksInPossible++;
 
-                    // Accumulate
                     if (signal >= ConfirmThreshold) _scoreTicks += 2.0f;
                     else if (signal >= EnterThreshold) _scoreTicks += 1.0f;
 
-                    // Check Threshold
+                    // Trigger Check
                     if (_scoreTicks >= eventTicksTarget)
                     {
-                        // --- DETECTED ---
                         _state = RippleState.Ripple;
                         _eventCount++;
                         _lastEventScore = _scoreTicks * 0.5f;
@@ -183,27 +139,19 @@ namespace DeepBrainInterface
 
                         if (TriggerDelayMs > 0)
                         {
-                            // Arm the delay. Return TTL=False for now.
-                            _ttlArmed = true;
-                            _ttlAtMs = now + TriggerDelayMs;
+                            _ttlArmed = true; _ttlAtMs = now + TriggerDelayMs;
                             return Pack(signal, artifact, false, false, null);
                         }
                         else
                         {
-                            // No delay? Fire immediately.
-                            triggerFrame = true;
-                            triggerSnapshot = rawInput?.Clone();
-
-                            _ttlHolding = true;
-                            _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
+                            triggerFrame = true; triggerSnapshot = rawInput?.Clone();
+                            _ttlHolding = true; _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
                         }
                     }
-                    // Drop out
+                    // Drop Out
                     else if (signal < GateThreshold)
                     {
-                        _state = RippleState.NoRipple;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
+                        _state = RippleState.NoRipple; _scoreTicks = 0; _ticksInPossible = 0;
                     }
                     // Decay
                     else if (_ticksInPossible > DecayGraceTicks)
@@ -214,14 +162,7 @@ namespace DeepBrainInterface
                     break;
 
                 case RippleState.Ripple:
-                    // Only exit if signal drops (handled here if detection continues without triggering)
-                    // Note: If we triggered, we are in Block 1 or 2, so we never reach here.
-                    if (signal < GateThreshold)
-                    {
-                        _state = RippleState.NoRipple;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
-                    }
+                    if (signal < GateThreshold) { _state = RippleState.NoRipple; _scoreTicks = 0; _ticksInPossible = 0; }
                     break;
             }
 
@@ -241,56 +182,55 @@ namespace DeepBrainInterface
                 EventPulse = pulse,
                 TriggerPulse = pulse,
                 TTL = ttl,
-                TriggerData = data,
-                StrideUsed = 0
+                TriggerData = data
             };
         }
 
-        // ---- Boilerplate (Unchanged) ----
+        // ==============================================================================
+        // 4. OVERLOADS (The Critical Fix)
+        // ==============================================================================
+
+        // Helper: Extracts (Signal, Artifact) from a 2x1 Mat
+        private void ExtractProbs(Mat m, out float sig, out float art)
+        {
+            sig = 0; art = 0;
+            if (m != null && m.Depth == Depth.F32)
+            {
+                unsafe
+                {
+                    float* ptr = (float*)m.Data.ToPointer();
+                    int len = m.Rows * m.Cols;
+                    if (len >= 1) sig = ptr[0];
+                    if (len >= 2) art = ptr[1];
+                }
+            }
+        }
+
+        // >>> PRIMARY OVERLOAD: Accepts pure Mat (Output of Detector) <<<
         public IObservable<RippleOut> Process(IObservable<Mat> source)
         {
-            return source.Select(m =>
-            {
-                float sig = 0, art = 0;
-                int totalElements = m.Rows * m.Cols * m.Channels;
-                if (totalElements >= 2 && m.Depth == Depth.F32)
-                {
-                    unsafe
-                    {
-                        float* ptr = (float*)m.Data.ToPointer();
-                        sig = ptr[0];
-                        art = ptr[1];
-                    }
-                }
-                else if (m.Depth == Depth.F32)
-                {
-                    unsafe { sig = *((float*)m.Data.ToPointer()); }
-                }
-                return Update(sig, art, true, m);
+            return source.Select(m => {
+                ExtractProbs(m, out float s, out float a);
+                // Default: Gate is TRUE (Open), Raw Input is the Prob Mat itself
+                return Update(s, a, true, m);
             });
         }
 
+        // Optional: Mat + Bool Gate (e.g. from WithLatestFrom BNO)
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
         {
-            return source.Select(t =>
-            {
-                float sig = 0, art = 0;
-                Mat m = t.Item1;
-                int totalElements = m.Rows * m.Cols * m.Channels;
-                if (totalElements >= 2 && m.Depth == Depth.F32)
-                {
-                    unsafe
-                    {
-                        float* ptr = (float*)m.Data.ToPointer();
-                        sig = ptr[0];
-                        art = ptr[1];
-                    }
-                }
-                else if (m.Depth == Depth.F32)
-                {
-                    unsafe { sig = *((float*)m.Data.ToPointer()); }
-                }
-                return Update(sig, art, t.Item2, m);
+            return source.Select(t => {
+                ExtractProbs(t.Item1, out float s, out float a);
+                return Update(s, a, t.Item2, t.Item1);
+            });
+        }
+
+        // Optional: Mat + Int Gate (e.g. Arduino TTL line)
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, int>> source)
+        {
+            return source.Select(t => {
+                ExtractProbs(t.Item1, out float s, out float a);
+                return Update(s, a, t.Item2 != 0, t.Item1);
             });
         }
     }

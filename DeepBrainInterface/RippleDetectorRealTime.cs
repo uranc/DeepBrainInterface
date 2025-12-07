@@ -5,221 +5,193 @@ using OpenCV.Net;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Drawing.Design;
+using System.Windows.Forms.Design;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Maximum Performance: OrtIoBinding + Pinned Memory + Latency Optimization.")]
+    [Description("High-Performance ONNX Inference (Strict Batch 1 or 2, Pinned Memory).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorOptimized
+    public class RippleDetectorRealTime
     {
-        public string ModelPath { get; set; } = "ripple_detector.onnx";
+        // ==============================================================================
+        // 1. CONFIGURATION
+        // ==============================================================================
+        [Category("Model")]
+        [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
+        public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
-        // Input Dimensions
-        public int TimePoints { get; set; } = 92;
+        [Category("Model")]
+        [Description("Strictly 1 (Signal) or 2 (Signal + Artifact).")]
+        public int BatchSize { get; set; } = 2;
+
+        [Category("Model")]
+        public int TimePoints { get; set; } = 44;
+
+        [Category("Model")]
         public int Channels { get; set; } = 8;
 
-        // ---- ONNX RESOURCES ----
-        private InferenceSession _session;
-        private OrtIoBinding _binding; // UPDATED HERE
-        private RunOptions _runOptions;
-        private OrtMemoryInfo _memInfo;
+        // ==============================================================================
+        // INTERNAL RESOURCES
+        // ==============================================================================
+        InferenceSession _session;
+        OrtIoBinding _ioBinding;
+        RunOptions _runOptions;
+        OrtMemoryInfo _memInfo;
 
-        private string _inputName;
-        private string _outputName;
+        // Fixed Pinned Memory
+        float[] _inputBuffer;
+        GCHandle _inputPin;
+        OrtValue _inputOrtValue;
 
-        // ---- PINNED MEMORY BUFFERS ----
-        private float[] _inputBuffer;
-        private GCHandle _inputPin;
-        private OrtValue _inputOrtValue;
+        float[] _outputBuffer;
+        GCHandle _outputPin;
+        OrtValue _outputOrtValue;
 
-        private float[] _outputBuffer;
-        private GCHandle _outputPin;
-        private OrtValue _outputOrtValue;
+        struct InputPackage { public Mat[] Mats; }
 
-        private int _currentCapacity = 0;
-        private int _activeBatchSize = 0;
-
-        private void InitializeSession()
+        private void Initialise()
         {
             if (_session != null) return;
+            if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
 
-            // PERFORMANCE TUNING: OPTIMIZE FOR LATENCY
-            var options = new SessionOptions
+            // A. CONFIGURE SESSION
+            var opts = new SessionOptions
             {
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
                 IntraOpNumThreads = 1,
                 InterOpNumThreads = 1,
-                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 EnableCpuMemArena = true
             };
+            opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
 
-            // CPU Specifics (Critical for Intel CPUs)
-            options.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
-
-            _session = new InferenceSession(ModelPath, options);
+            _session = new InferenceSession(ModelPath, opts);
             _memInfo = OrtMemoryInfo.DefaultInstance;
-
-            // Create the binding (using the corrected type)
-            _binding = _session.CreateIoBinding();
-
+            _ioBinding = _session.CreateIoBinding();
             _runOptions = new RunOptions();
 
-            _inputName = _session.InputMetadata.Keys.First();
-            _outputName = _session.OutputMetadata.Keys.First();
-        }
+            // B. STRICT ALLOCATION
+            int inputLen = BatchSize * TimePoints * Channels;
+            _inputBuffer = new float[inputLen];
+            _inputPin = GCHandle.Alloc(_inputBuffer, GCHandleType.Pinned);
 
-        private void PrepareBinding(int batchSize)
-        {
-            InitializeSession();
+            int outputLen = BatchSize; // [Batch, 1]
+            _outputBuffer = new float[outputLen];
+            _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
 
-            bool capacityChanged = batchSize > _currentCapacity;
-            bool shapeChanged = batchSize != _activeBatchSize;
+            // C. BINDING SETUP
+            var inputName = _session.InputMetadata.Keys.First();
+            var outputName = _session.OutputMetadata.Keys.First();
 
-            // 1. Resize Physical Memory (If needed)
-            if (capacityChanged)
+            long[] inShape = new long[] { BatchSize, TimePoints, Channels };
+            long[] outShape = new long[] { BatchSize, 1 };
+
+            unsafe
             {
-                DisposeOrtValues();
-                if (_inputPin.IsAllocated) _inputPin.Free();
-                if (_outputPin.IsAllocated) _outputPin.Free();
+                _inputOrtValue = OrtValue.CreateTensorValueWithData(
+                    _memInfo,
+                    TensorElementType.Float,
+                    inShape,
+                    _inputPin.AddrOfPinnedObject(),
+                    inputLen * sizeof(float)
+                );
 
-                _currentCapacity = Math.Max(batchSize, _currentCapacity);
-
-                // Allocate Input [Batch * Time * Channels]
-                int inSize = _currentCapacity * TimePoints * Channels;
-                _inputBuffer = new float[inSize];
-                _inputPin = GCHandle.Alloc(_inputBuffer, GCHandleType.Pinned);
-
-                // Allocate Output [Batch * 1]
-                int outSize = _currentCapacity;
-                _outputBuffer = new float[outSize];
-                _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
+                _outputOrtValue = OrtValue.CreateTensorValueWithData(
+                    _memInfo,
+                    TensorElementType.Float,
+                    outShape,
+                    _outputPin.AddrOfPinnedObject(),
+                    outputLen * sizeof(float)
+                );
             }
 
-            // 2. Update ONNX Binding (If shape changed)
-            if (capacityChanged || shapeChanged)
+            _ioBinding.BindInput(inputName, _inputOrtValue);
+            _ioBinding.BindOutput(outputName, _outputOrtValue);
+
+            // Warmup
+            _session.RunWithBinding(_runOptions, _ioBinding);
+        }
+
+        private IObservable<Mat> ProcessInternal(IObservable<InputPackage> source)
+        {
+            return source.Select(input =>
             {
-                DisposeOrtValues();
+                Initialise();
 
-                long[] inShape = new long[] { batchSize, TimePoints, Channels };
-                long[] outShape = new long[] { batchSize, 1 };
+                if (input.Mats.Length != BatchSize)
+                    throw new InvalidOperationException($"Input count {input.Mats.Length} does not match BatchSize {BatchSize}");
 
+                // 1. FAST COPY
                 unsafe
                 {
-                    // Create Zero-Copy Native Wrapper for Input
-                    _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                        _memInfo,
-                        TensorElementType.Float,
-                        inShape,
-                        _inputPin.AddrOfPinnedObject(),
-                        batchSize * TimePoints * Channels * sizeof(float)
-                    );
+                    float* dstBase = (float*)_inputPin.AddrOfPinnedObject().ToPointer();
+                    int stride = TimePoints * Channels;
+                    long bytesPerMat = stride * sizeof(float);
 
-                    // Create Zero-Copy Native Wrapper for Output
-                    _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                        _memInfo,
-                        TensorElementType.Float,
-                        outShape,
-                        _outputPin.AddrOfPinnedObject(),
-                        batchSize * sizeof(float)
-                    );
-                }
-
-                // Bind wrappers to the session
-                _binding.ClearBoundInputs();
-                _binding.ClearBoundOutputs();
-                _binding.BindInput(_inputName, _inputOrtValue);
-                _binding.BindOutput(_outputName, _outputOrtValue);
-
-                _activeBatchSize = batchSize;
-            }
-        }
-
-        private void DisposeOrtValues()
-        {
-            _inputOrtValue?.Dispose();
-            _inputOrtValue = null;
-            _outputOrtValue?.Dispose();
-            _outputOrtValue = null;
-        }
-
-        private Mat RunInference(params Mat[] mats)
-        {
-            int batchSize = mats.Length;
-            if (batchSize == 0) return null;
-
-            // Step 1: Ensure Memory & Bindings are correct
-            PrepareBinding(batchSize);
-
-            // Step 2: Copy Data to Pinned Buffer (Unsafe Fast Copy)
-            unsafe
-            {
-                float* dstBase = (float*)_inputPin.AddrOfPinnedObject().ToPointer();
-                int stride = TimePoints * Channels;
-                long bytesPerMat = stride * sizeof(float);
-
-                for (int i = 0; i < batchSize; i++)
-                {
-                    float* src = (float*)mats[i].Data.ToPointer();
-                    float* dst = dstBase + (i * stride);
-
-                    if (mats[i].Rows == TimePoints && mats[i].Cols == Channels)
+                    for (int i = 0; i < BatchSize; i++)
                     {
-                        Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
-                    }
-                    else if (mats[i].Rows == Channels && mats[i].Cols == TimePoints)
-                    {
-                        for (int c = 0; c < Channels; c++)
+                        float* src = (float*)input.Mats[i].Data.ToPointer();
+                        float* dst = dstBase + (i * stride);
+
+                        if (input.Mats[i].Rows == TimePoints && input.Mats[i].Cols == Channels)
                         {
-                            int cOff = c * TimePoints;
-                            for (int t = 0; t < TimePoints; t++)
+                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
+                        }
+                        else if (input.Mats[i].Rows == Channels && input.Mats[i].Cols == TimePoints)
+                        {
+                            for (int c = 0; c < Channels; c++)
                             {
-                                dst[t * Channels + c] = src[cOff + t];
+                                int cOff = c * TimePoints;
+                                for (int t = 0; t < TimePoints; t++)
+                                {
+                                    dst[t * Channels + c] = src[cOff + t];
+                                }
                             }
                         }
-                    }
-                    else
-                    {
-                        Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
+                        else
+                        {
+                            Buffer.MemoryCopy(src, dst, bytesPerMat, bytesPerMat);
+                        }
                     }
                 }
-            }
 
-            // Step 3: EXECUTE (Zero Allocation)
-            _session.RunWithBinding(_runOptions, _binding);
+                // 2. INFERENCE
+                _session.RunWithBinding(_runOptions, _ioBinding);
 
-            // Step 4: Retrieve Result
-            var outMat = new Mat(batchSize, 1, Depth.F32, 1);
-            unsafe
-            {
-                float* resultPtr = (float*)outMat.Data.ToPointer();
-                Marshal.Copy(_outputBuffer, 0, (IntPtr)resultPtr, batchSize);
-            }
+                // 3. RETURN RESULT (Copy Pinned Output -> New Mat)
+                var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
+                unsafe
+                {
+                    float* dst = (float*)outMat.Data.ToPointer();
+                    Marshal.Copy(_outputBuffer, 0, (IntPtr)dst, BatchSize);
+                }
 
-            return outMat;
+                return outMat;
+            });
         }
+
+        // --- PIPELINE OVERLOADS ---
 
         public IObservable<Mat> Process(IObservable<Mat> source)
-        {
-            return source.Select(m => RunInference(m));
-        }
+            => ProcessInternal(source.Select(m => new InputPackage { Mats = new[] { m } }));
 
         public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
-        {
-            return source.Select(t => RunInference(t.Item1, t.Item2));
-        }
+            => ProcessInternal(source.Select(t => new InputPackage { Mats = new[] { t.Item1, t.Item2 } }));
 
         public void Unload()
         {
-            DisposeOrtValues();
+            _inputOrtValue?.Dispose(); _outputOrtValue?.Dispose();
             if (_inputPin.IsAllocated) _inputPin.Free();
             if (_outputPin.IsAllocated) _outputPin.Free();
-            _binding?.Dispose();
-            _runOptions?.Dispose();
-            _session?.Dispose();
+            _ioBinding?.Dispose(); _runOptions?.Dispose(); _session?.Dispose();
         }
     }
 }
