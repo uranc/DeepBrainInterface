@@ -10,6 +10,7 @@ using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Drawing.Design;
 using System.Windows.Forms.Design;
+using System.Diagnostics; // Added for Stopwatch
 
 namespace DeepBrainInterface
 {
@@ -60,6 +61,9 @@ namespace DeepBrainInterface
         private InferenceSession _session;
         private OrtIoBinding _ioBinding;
         private RunOptions _runOptions;
+
+        // Benchmarking
+        private Stopwatch _benchmarker = new Stopwatch(); // Added
 
         // Pinned Memory
         private GCHandle _inputPin;
@@ -227,8 +231,17 @@ namespace DeepBrainInterface
 
         private Mat RunInference()
         {
+            // Start Timer
+            _benchmarker.Restart();
+
             // 1. Execute on GPU (Data auto-transfers via Binding)
             _session.RunWithBinding(_runOptions, _ioBinding);
+
+            // Stop Timer
+            _benchmarker.Stop();
+
+            // Log Time (Check Bonsai Console Window)
+            Console.WriteLine($"Inference: {_benchmarker.Elapsed.TotalMilliseconds:F4} ms | Provider: {Provider}");
 
             // 2. Return Result
             var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
