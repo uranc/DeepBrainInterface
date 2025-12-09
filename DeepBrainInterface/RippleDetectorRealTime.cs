@@ -5,13 +5,14 @@ using OpenCV.Net;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
+using System.Diagnostics; // This namespace contains the 'Process' class
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Drawing.Design;
 using System.Windows.Forms.Design;
+using System.Runtime;     // For GCSettings
 
 namespace DeepBrainInterface
 {
@@ -54,10 +55,31 @@ namespace DeepBrainInterface
         private float[] _outputBuffer; // Managed array for result copying
         private int _batchStrideFloats; // Floats per batch item
 
+        // NEW: Reusable Output Matrix (Zero-Allocation)
+        private Mat _reusableOutputMat;
+
         private void Initialise()
         {
             if (_session != null) return;
             if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
+
+            // ------------------------------------------------------------
+            // NEW: SYSTEM OPTIMIZATIONS (RealTime & GC)
+            // ------------------------------------------------------------
+            try
+            {
+                // FIX IS HERE: Use "System.Diagnostics.Process" explicitly
+                // because your class has a method named "Process", confusing the compiler.
+                System.Diagnostics.Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+
+                // Tell .NET to delay garbage collection as long as possible
+                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Warning] Optimization Failed: {ex.Message}");
+            }
+            // ------------------------------------------------------------
 
             // A. PERFORMANCE TWEAKS & SESSION CONFIG
             var opts = new SessionOptions
@@ -94,6 +116,9 @@ namespace DeepBrainInterface
 
             _outputBuffer = new float[totalOutputFloats];
             _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
+
+            // NEW: Pre-allocate the OpenCV Matrix once
+            _reusableOutputMat = new Mat(BatchSize, 1, Depth.F32, 1);
 
             // D. BINDING (Zero Copy Inference)
             var memInfo = OrtMemoryInfo.DefaultInstance;
@@ -204,21 +229,27 @@ namespace DeepBrainInterface
         private Mat RunInference()
         {
             // 1. Execute (Zero-Copy)
+            // Input data is already at the pinned location via RobustTransposeCopy
+            // Output will be written directly to _outputBuffer
             _session.RunWithBinding(_runOptions, _ioBinding);
 
-            // 2. Result (Minimal Allocation)
-            // We create a tiny 1x2 Mat for the output. 
-            // This is the only per-frame allocation.
-            var outMat = new Mat(BatchSize, 1, Depth.F32, 1);
+            // 2. Result (Zero Allocation)
+            // We reuse the pre-allocated Mat. 
+            // We simply copy the raw floats from our buffer into the Mat's data pointer.
             unsafe
             {
-                Marshal.Copy(_outputBuffer, 0, outMat.Data, BatchSize);
+                Marshal.Copy(_outputBuffer, 0, _reusableOutputMat.Data, BatchSize);
             }
-            return outMat;
+
+            // Return the reuseable object.
+            // CAUTION: Downstream nodes must consume this immediately or Clone() it,
+            // because the data inside this Mat will change on the very next frame.
+            return _reusableOutputMat;
         }
 
         public void Unload()
         {
+            _reusableOutputMat?.Dispose(); // Dispose the reusable Mat
             _inputOrtValue?.Dispose();
             _outputOrtValue?.Dispose();
             if (_inputPin.IsAllocated) _inputPin.Free();

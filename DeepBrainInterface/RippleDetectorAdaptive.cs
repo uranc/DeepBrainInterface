@@ -3,270 +3,278 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Runtime;
 using System.Runtime.InteropServices;
-using System.Drawing.Design;
-using System.Windows.Forms.Design;
+// Alias for Process to avoid collisions
+using SysProcess = System.Diagnostics.Process;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Adaptive Ripple Detector: Fixed Batch (1 or 2) + Stride Gate + Logic.")]
+    [Description("Adaptive Ripple Detector: Batch (1 or 2) + Stride Gate + Logic.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorAdaptive
     {
-        // ==============================================================================
-        // 1. PARAMETERS
-        // ==============================================================================
+        // --- CONFIGURATION ---
+
         [Category("Model")]
-        [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
+        [Description("Path to the ONNX model file.")]
+        [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", "System.Drawing.Design.UITypeEditor, System.Drawing")]
+        [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
-        [Category("Model")]
-        [Description("Set strictly to 1 (Signal) or 2 (Signal + Artifact).")]
-        public int BatchSize { get; set; } = 2;
+        [Category("Model")] public int TimePoints { get; set; } = 44;
+        [Category("Model")] public int Channels { get; set; } = 8;
 
-        [Category("Model")]
-        public int TimePoints { get; set; } = 44;
-
-        [Category("Model")]
-        public int Channels { get; set; } = 8;
-
-        // ==============================================================================
-        // 2. LOGIC & STRIDE
-        // ==============================================================================
         [Category("Logic")]
-        [Description("Embedded State Machine (Thresholds, Delays).")]
         [TypeConverter(typeof(ExpandableObjectConverter))]
         public RippleStateMachineMatBool StateMachine { get; set; } = new RippleStateMachineMatBool();
 
-        [Category("Stride"), DisplayName("K (Relaxed)")]
-        [Description("Frames to skip when NO ripple is detected.")]
-        public int KBelowGate { get; set; } = 5;
+        [Category("Stride")] public int KBelowGate { get; set; } = 5;
+        [Category("Stride")] public int KAtGate { get; set; } = 1;
 
-        [Category("Stride"), DisplayName("K (Active)")]
-        [Description("Frames to skip when ripple is POSSIBLE (usually 1).")]
-        public int KAtGate { get; set; } = 1;
+        // Hardware Config
+        public enum InferenceProvider { Cpu, Cuda, TensorRt }
+        [Category("Hardware")] public InferenceProvider Provider { get; set; } = InferenceProvider.Cuda;
+        [Category("Hardware")] public int TargetCoreIndex { get; set; } = 4;
 
-        // ==============================================================================
-        // 3. INTERNAL RESOURCES
-        // ==============================================================================
-        private InferenceSession _session;
-        private OrtIoBinding _ioBinding;
-        private RunOptions _runOptions;
 
-        // Pinned Buffers
-        private GCHandle _inputPin;
-        private GCHandle _outputPin;
-        private OrtValue _inputOrtValue;
-        private OrtValue _outputOrtValue;
+        // --- PROCESS METHODS (Infers Batch Size) ---
 
-        // Buffers
-        private float[] _outputBuffer;
-        private int _batchStrideFloats;
-
-        // Logic State
-        private int _strideCounter;
-        private int _currentK = 1;
-
-        private void Initialise()
-        {
-            if (_session != null) return;
-            if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
-
-            // A. SESSION CONFIG (Strict CPU)
-            var opts = new SessionOptions
-            {
-                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                IntraOpNumThreads = 1,
-                InterOpNumThreads = 1,
-                EnableCpuMemArena = true
-            };
-            opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
-            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
-
-            _session = new InferenceSession(ModelPath, opts);
-            _ioBinding = _session.CreateIoBinding();
-            _runOptions = new RunOptions();
-
-            // B. SIZE CALCULATIONS
-            _batchStrideFloats = TimePoints * Channels;
-            int totalInputFloats = BatchSize * _batchStrideFloats;
-
-            // C. PINNED ALLOCATION
-            var inputData = new float[totalInputFloats];
-            _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
-
-            _outputBuffer = new float[BatchSize];
-            _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
-
-            // D. BINDING
-            var memInfo = OrtMemoryInfo.DefaultInstance;
-            unsafe
-            {
-                _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, TimePoints, Channels },
-                    _inputPin.AddrOfPinnedObject(),
-                    totalInputFloats * sizeof(float)
-                );
-
-                _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, 1 },
-                    _outputPin.AddrOfPinnedObject(),
-                    _outputBuffer.Length * sizeof(float)
-                );
-            }
-
-            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
-            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
-
-            // Warmup
-            _session.RunWithBinding(_runOptions, _ioBinding);
-        }
-
-        // ==============================================================================
-        // 4. PROCESSING LOGIC
-        // ==============================================================================
-
-        // --- BATCH 2 OVERLOADS ---
-
+        // Case 1: Batch = 2 (Signal + Artifact)
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
         {
-            return source.Where(_ => CheckStride()).Select(t => RunBatch2(t.Item1, t.Item2, true));
+            return Observable.Using(
+                () => CreateEngine(batchSize: 2),
+                (AdaptiveEngine engine) =>
+                    source.Where(_ => engine.CheckStride())
+                          .Select(input => engine.ExecuteBatch2(input.Item1, input.Item2, true, StateMachine, KBelowGate, KAtGate))
+            );
         }
 
+        // Case 2: Batch = 2 (Signal + Artifact + Boolean Flag)
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
-            return source.Where(_ => CheckStride()).Select(t => RunBatch2(t.Item1.Item1, t.Item1.Item2, t.Item2));
+            return Observable.Using(
+                () => CreateEngine(batchSize: 2),
+                (AdaptiveEngine engine) =>
+                    source.Where(_ => engine.CheckStride())
+                          .Select(input => engine.ExecuteBatch2(input.Item1.Item1, input.Item1.Item2, input.Item2, StateMachine, KBelowGate, KAtGate))
+            );
         }
 
-        // --- BATCH 1 OVERLOADS ---
-
+        // Case 3: Batch = 1 (Signal Only)
         public IObservable<RippleOut> Process(IObservable<Mat> source)
         {
-            return source.Where(_ => CheckStride()).Select(m => RunBatch1(m, true));
+            return Observable.Using(
+                () => CreateEngine(batchSize: 1),
+                (AdaptiveEngine engine) =>
+                    source.Where(_ => engine.CheckStride())
+                          .Select(input => engine.ExecuteBatch1(input, true, StateMachine, KBelowGate, KAtGate))
+            );
         }
 
+        // Case 4: Batch = 1 (Signal + Boolean Flag)
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
         {
-            return source.Where(_ => CheckStride()).Select(t => RunBatch1(t.Item1, t.Item2));
+            return Observable.Using(
+                () => CreateEngine(batchSize: 1),
+                (AdaptiveEngine engine) =>
+                    source.Where(_ => engine.CheckStride())
+                          .Select(input => engine.ExecuteBatch1(input.Item1, input.Item2, StateMachine, KBelowGate, KAtGate))
+            );
         }
 
-
-        // ==============================================================================
-        // 5. CORE EXECUTION
-        // ==============================================================================
-
-        private bool CheckStride()
+        // --- FACTORY ---
+        private AdaptiveEngine CreateEngine(int batchSize)
         {
-            // If K=1, always run. If K>1, skip (K-1) frames.
-            if (_currentK <= 1) return true;
+            // Apply CPU Locking
+            OptimizeThread(TargetCoreIndex);
 
-            _strideCounter++;
-            if (_strideCounter >= _currentK)
+            return new AdaptiveEngine(ModelPath, Provider, batchSize, Channels, TimePoints);
+        }
+
+        private static void OptimizeThread(int coreIndex)
+        {
+            try
             {
-                _strideCounter = 0;
-                return true;
-            }
-            return false;
-        }
-
-        private RippleOut RunBatch2(Mat signal, Mat artifact, bool bnoOk)
-        {
-            Initialise();
-            if (BatchSize != 2) throw new InvalidOperationException("Adaptive Config is Batch 2, but received Batch 1.");
-
-            unsafe
-            {
-                float* ptr = (float*)_inputPin.AddrOfPinnedObject();
-                RobustTransposeCopy(signal, ptr);
-                RobustTransposeCopy(artifact, ptr + _batchStrideFloats);
-            }
-
-            _session.RunWithBinding(_runOptions, _ioBinding);
-
-            // Read Output Directly from Pinned Buffer
-            float sigProb = _outputBuffer[0];
-            float artProb = _outputBuffer[1];
-
-            return UpdateState(sigProb, artProb, bnoOk, signal);
-        }
-
-        private RippleOut RunBatch1(Mat signal, bool bnoOk)
-        {
-            Initialise();
-            if (BatchSize != 1) throw new InvalidOperationException("Adaptive Config is Batch 1, but received Batch 2.");
-
-            unsafe
-            {
-                RobustTransposeCopy(signal, (float*)_inputPin.AddrOfPinnedObject());
-            }
-
-            _session.RunWithBinding(_runOptions, _ioBinding);
-
-            // Read Output
-            float sigProb = _outputBuffer[0];
-
-            return UpdateState(sigProb, 0f, bnoOk, signal);
-        }
-
-        private RippleOut UpdateState(float sigP, float artP, bool bnoOk, Mat displayMat)
-        {
-            // Update State Machine
-            var result = StateMachine.Update(sigP, artP, bnoOk, displayMat);
-
-            // ADAPTIVE LOGIC:
-            // If we are in a Ripple or Candidate state, we go FAST (K=1).
-            // If we are in NoRipple state, we go SLOW (K=5 or user defined).
-            if (result.State != RippleState.NoRipple)
-                _currentK = KAtGate;
-            else
-                _currentK = KBelowGate;
-
-            result.StrideUsed = _currentK;
-            return result;
-        }
-
-        // ==============================================================================
-        // 6. ROBUST MEMORY OPS
-        // ==============================================================================
-
-        private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
-        {
-            if (src.Rows != Channels || src.Cols != TimePoints)
-                throw new InvalidOperationException($"Input must be {Channels}x{TimePoints}. Got {src.Rows}x{src.Cols}");
-
-            byte* srcRowPtr = (byte*)src.Data.ToPointer();
-            int srcStep = src.Step;
-
-            for (int c = 0; c < Channels; c++)
-            {
-                float* srcFloatRow = (float*)srcRowPtr;
-                for (int t = 0; t < TimePoints; t++)
+                if (Environment.OSVersion.Platform == PlatformID.Win32NT)
                 {
-                    dstBase[t * Channels + c] = srcFloatRow[t];
+                    SysProcess.GetCurrentProcess().ProcessorAffinity = new IntPtr(1 << coreIndex);
+                    SysProcess.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+                    GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
                 }
-                srcRowPtr += srcStep;
             }
+            catch { }
         }
 
-        public void Unload()
+        // --- ENGINE CLASS ---
+        public class AdaptiveEngine : IDisposable
         {
-            _inputOrtValue?.Dispose();
-            _outputOrtValue?.Dispose();
-            if (_inputPin.IsAllocated) _inputPin.Free();
-            if (_outputPin.IsAllocated) _outputPin.Free();
-            _ioBinding?.Dispose();
-            _runOptions?.Dispose();
-            _session?.Dispose();
-            _session = null;
+            private InferenceSession Session;
+            private OrtIoBinding IoBinding;
+            private RunOptions RunOpts;
+
+            // Memory Pins
+            private GCHandle InputPin, OutputPin;
+            private float[] OutputBuffer;
+
+            // Dimensions
+            private int _time, _channels, _batch;
+            private int _strideFloats;
+
+            // Stride Logic State
+            private int _strideCounter;
+            private int _currentK = 1;
+
+            public AdaptiveEngine(string path, InferenceProvider provider, int batch, int channels, int time)
+            {
+                _time = time;
+                _channels = channels;
+                _batch = batch;
+                _strideFloats = time * channels;
+
+                // Assuming model outputs 1 float per batch item (Binary Classification)
+                OutputBuffer = new float[batch];
+
+                try
+                {
+                    // 1. Session Options (Optimized)
+                    var opts = new SessionOptions();
+                    if (provider == InferenceProvider.Cuda)
+                    {
+                        try { opts.AppendExecutionProvider_CUDA(0); } catch { Console.WriteLine("[ERR] CUDA Failed"); }
+                    }
+                    else if (provider == InferenceProvider.TensorRt)
+                    {
+                        try { opts.AppendExecutionProvider_Tensorrt(0); opts.AppendExecutionProvider_CUDA(0); } catch { }
+                    }
+                    else
+                    {
+                        opts.IntraOpNumThreads = 1;
+                        opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+                        opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+                    }
+                    opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+
+                    // 2. Init Session
+                    Session = new InferenceSession(path, opts);
+                    RunOpts = new RunOptions();
+                    IoBinding = Session.CreateIoBinding();
+
+                    // 3. Pin Memory
+                    var inputBuffer = new float[batch * _strideFloats];
+                    InputPin = GCHandle.Alloc(inputBuffer, GCHandleType.Pinned);
+                    OutputPin = GCHandle.Alloc(OutputBuffer, GCHandleType.Pinned);
+
+                    // 4. Bind Tensor Wrappers
+                    var mem = OrtMemoryInfo.DefaultInstance;
+
+                    // Shape: [Batch, Time, Channels]
+                    var inOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inputBuffer), new long[] { batch, time, channels });
+                    var outOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(OutputBuffer), new long[] { batch, 1 }); // [Batch, 1]
+
+                    IoBinding.BindInput(Session.InputMetadata.Keys.First(), inOrt);
+                    IoBinding.BindOutput(Session.OutputMetadata.Keys.First(), outOrt);
+
+                    inOrt.Dispose(); outOrt.Dispose();
+                }
+                catch (Exception ex) { Console.WriteLine($"[FATAL] {ex.Message}"); throw; }
+            }
+
+            // --- STRIDE LOGIC ---
+            public bool CheckStride()
+            {
+                if (_currentK <= 1) return true;
+                _strideCounter++;
+                if (_strideCounter >= _currentK)
+                {
+                    _strideCounter = 0;
+                    return true;
+                }
+                return false;
+            }
+
+            // --- EXECUTION BATCH 1 ---
+            public RippleOut ExecuteBatch1(Mat signal, bool bnoOk, RippleStateMachineMatBool fsm, int kBelow, int kAt)
+            {
+                unsafe
+                {
+                    // Zero-copy Transpose
+                    TransposeToBuffer(signal, (float*)InputPin.AddrOfPinnedObject());
+                }
+
+                Session.RunWithBinding(RunOpts, IoBinding);
+
+                // Read Result directly from pinned buffer
+                float sigP = OutputBuffer[0];
+                float artP = 0f; // No artifact input
+
+                // Update Logic
+                var rippleOut = fsm.Update(sigP, artP, bnoOk, signal);
+
+                // Update Stride for next frame
+                _currentK = (rippleOut.State != RippleState.NoRipple) ? kAt : kBelow;
+                rippleOut.StrideUsed = _currentK;
+
+                return rippleOut;
+            }
+
+            // --- EXECUTION BATCH 2 ---
+            public RippleOut ExecuteBatch2(Mat signal, Mat artifact, bool bnoOk, RippleStateMachineMatBool fsm, int kBelow, int kAt)
+            {
+                unsafe
+                {
+                    float* ptr = (float*)InputPin.AddrOfPinnedObject();
+                    TransposeToBuffer(signal, ptr);
+                    TransposeToBuffer(artifact, ptr + _strideFloats); // Offset by 1 batch item
+                }
+
+                Session.RunWithBinding(RunOpts, IoBinding);
+
+                float sigP = OutputBuffer[0];
+                float artP = OutputBuffer[1];
+
+                var rippleOut = fsm.Update(sigP, artP, bnoOk, signal);
+
+                // Update Stride for next frame
+                _currentK = (rippleOut.State != RippleState.NoRipple) ? kAt : kBelow;
+                rippleOut.StrideUsed = _currentK;
+
+                return rippleOut;
+            }
+
+            // Optimized Transpose
+            private unsafe void TransposeToBuffer(Mat src, float* dstPtr)
+            {
+                float* srcPtr = (float*)src.Data.ToPointer();
+                int srcStep = src.Step / sizeof(float);
+
+                int tMax = _time;
+                int cMax = _channels;
+
+                int dstIdx = 0;
+                for (int t = 0; t < tMax; t++)
+                {
+                    for (int c = 0; c < cMax; c++)
+                    {
+                        dstPtr[dstIdx++] = srcPtr[(c * srcStep) + t];
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                Session?.Dispose(); IoBinding?.Dispose(); RunOpts?.Dispose();
+                if (InputPin.IsAllocated) InputPin.Free();
+                if (OutputPin.IsAllocated) OutputPin.Free();
+            }
         }
     }
 }

@@ -1,246 +1,234 @@
-﻿using Bonsai;
-using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
-using OpenCV.Net;
-using System;
+﻿using System;
 using System.ComponentModel;
-using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
-using System.Drawing.Design;
-using System.Windows.Forms.Design;
-using System.Diagnostics;
+using System.Threading;
 using System.Runtime;
+using System.Diagnostics;
+using Bonsai;
+using Microsoft.ML.OnnxRuntime;
+using OpenCV.Net;
+
+// Alias to avoid "Process" naming collisions
+using SysProcess = System.Diagnostics.Process;
 
 namespace DeepBrainInterface
 {
-    public enum OnnxProvider { Cpu, Cuda, TensorRT }
+    // Result struct to allow plotting latency spikes
+    public struct InferenceResult
+    {
+        public Mat Output;
+        public double LatencyMicroseconds;
+    }
 
     [Combinator]
-    [Description("High-Performance GPU Inference (Zero-Allocation Loop).")]
+    [Description("High-performance ONNX inference (Batch 1 or 2). Measures Latency.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorGPU
+    public class RippleDetectorGPU : Combinator<Mat, InferenceResult>
     {
-        // ... (Configuration properties same as before) ...
-        [Category("Model")]
-        [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
-        public string ModelPath { get; set; } = @"ripple_detector.onnx";
+        // --- CONFIGURATION ---
 
-        [Category("Model")]
-        public int BatchSize { get; set; } = 2;
+        [Description("Path to the ONNX model file.")]
+        [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", "System.Drawing.Design.UITypeEditor, System.Drawing")]
+        [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
+        public string ModelPath { get; set; }
 
-        [Category("Data Dimensions")]
-        public int TimePoints { get; set; } = 44;
+        [Description("Hardware backend.")]
+        public InferenceProvider Provider { get; set; } = InferenceProvider.Cuda;
 
-        [Category("Data Dimensions")]
-        public int Channels { get; set; } = 8;
+        [Description("Samples per channel (Time).")]
+        public int TimePoint { get; set; } = 44;
 
-        [Category("Execution Provider")]
-        public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
+        [Description("Number of channels.")]
+        public int ChannelNo { get; set; } = 8;
 
-        [Category("Execution Provider")]
-        public int DeviceId { get; set; } = 0;
+        public enum InferenceProvider { Cpu, Cuda, TensorRt }
 
-        [Category("Threading")]
-        public int IntraOpNumThreads { get; set; } = 1;
-
-        [Category("Threading")]
-        public int InterOpNumThreads { get; set; } = 1;
-
-        // ... Resources ...
-        private InferenceSession _session;
-        private OrtIoBinding _ioBinding;
-        private RunOptions _runOptions;
-        private Stopwatch _benchmarker = new Stopwatch();
-
-        // Memory Resources
-        private GCHandle _inputPin;
-        private GCHandle _outputPin;
-        private OrtValue _inputOrtValue;
-        private OrtValue _outputOrtValue;
-        private float[] _outputBuffer; // The raw pinned memory for ONNX
-
-        // NEW: The reusable container for Bonsai
-        private Mat _reusableOutputMat;
-
-        private int _batchStrideFloats;
-
-        // Optimization: Track GC to prove spikes
-        private int _lastGcCount = 0;
-
-        private void Initialise()
+        // --- SINGLE INPUT (Batch = 1) ---
+        public override IObservable<InferenceResult> Process(IObservable<Mat> source)
         {
-            if (_session != null) return;
+            return Observable.Using(
+                () => CreateEngine(batchSize: 1),
+                (InferenceEngine engine) => source.Select(input => engine.Execute(input))
+            );
+        }
 
-            // 1. System Priority (Crucial for <1ms stability)
+        // --- TUPLE INPUT (Batch = 2) ---
+        public IObservable<InferenceResult> Process(IObservable<Tuple<Mat, Mat>> source)
+        {
+            return Observable.Using(
+                () => CreateEngine(batchSize: 2),
+                (InferenceEngine engine) => source.Select(input => engine.ExecuteBatch(input.Item1, input.Item2))
+            );
+        }
+
+        // --- FACTORY ---
+        private InferenceEngine CreateEngine(int batchSize)
+        {
+            // HARDCODED: Core 4, RealTime Priority
+            OptimizeThread(coreIndex: 4);
+
+            // HARDCODED: Output size is 1 per input (Scalar classification)
+            int totalOutputSize = 1 * batchSize;
+
+            return new InferenceEngine(ModelPath, Provider, batchSize, ChannelNo, TimePoint, totalOutputSize);
+        }
+
+        private static void OptimizeThread(int coreIndex)
+        {
             try
             {
-                Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
-                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
-            }
-            catch (Exception ex) { Console.WriteLine(ex.Message); }
-
-            // 2. ONNX Config
-            var opts = new SessionOptions
-            {
-                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                IntraOpNumThreads = IntraOpNumThreads,
-                InterOpNumThreads = InterOpNumThreads
-            };
-
-            if (Provider == OnnxProvider.TensorRT)
-            {
-                string cacheDir = Path.GetDirectoryName(Path.GetFullPath(ModelPath));
-                Environment.SetEnvironmentVariable("ORT_TENSORRT_FP16_ENABLE", "1");
-                Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_ENABLE", "1");
-                Environment.SetEnvironmentVariable("ORT_TENSORRT_ENGINE_CACHE_PATH", cacheDir);
-            }
-
-            try
-            {
-                if (Provider == OnnxProvider.TensorRT)
+                if (Environment.OSVersion.Platform == PlatformID.Win32NT)
                 {
-                    opts.AppendExecutionProvider_Tensorrt(DeviceId);
-                    opts.AppendExecutionProvider_CUDA(DeviceId);
+                    SysProcess.GetCurrentProcess().ProcessorAffinity = new IntPtr(1 << coreIndex);
+                    SysProcess.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+                    GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
                 }
-                else if (Provider == OnnxProvider.Cuda) opts.AppendExecutionProvider_CUDA(DeviceId);
             }
-            catch (Exception ex) { Console.WriteLine($"[GPU Init Failed] {ex.Message}"); }
-
-            _session = new InferenceSession(ModelPath, opts);
-            _ioBinding = _session.CreateIoBinding();
-            _runOptions = new RunOptions();
-
-            // 3. Allocations (DONE EXACTLY ONCE)
-            _batchStrideFloats = TimePoints * Channels;
-            int totalInputFloats = BatchSize * _batchStrideFloats;
-
-            var inputData = new float[totalInputFloats];
-            _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
-
-            _outputBuffer = new float[BatchSize];
-            _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
-
-            // PRE-ALLOCATE THE OUTPUT MAT
-            // We will never create a new Mat() after this line.
-            _reusableOutputMat = new Mat(BatchSize, 1, Depth.F32, 1);
-
-            // Bindings
-            var memInfo = OrtMemoryInfo.DefaultInstance;
-            unsafe
-            {
-                _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, TimePoints, Channels },
-                    _inputPin.AddrOfPinnedObject(),
-                    totalInputFloats * sizeof(float)
-                );
-
-                _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, 1 },
-                    _outputPin.AddrOfPinnedObject(),
-                    _outputBuffer.Length * sizeof(float)
-                );
-            }
-
-            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
-            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
-
-            // Warmup
-            _session.RunWithBinding(_runOptions, _ioBinding);
+            catch { /* Fail silently or log if needed */ }
         }
 
-        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
+        // --- ENGINE ---
+        public class InferenceEngine : IDisposable
         {
-            return source.Select(input =>
+            private InferenceSession Session;
+            private OrtIoBinding IoBinding;
+            private RunOptions RunOpts;
+
+            private GCHandle InputPin, OutputPin;
+            private float[] OutputBuffer;
+
+            private int _time, _channels;
+            private int _strideFloats;
+
+            // Profiling
+            private Stopwatch _watch;
+            private double _freqInv;
+
+            public InferenceEngine(string path, InferenceProvider provider, int batch, int channels, int time, int outSize)
             {
-                Initialise();
+                _time = time;
+                _channels = channels;
+                _strideFloats = time * channels;
+                OutputBuffer = new float[outSize];
+
+                _watch = new Stopwatch();
+                _freqInv = 1_000_000.0 / Stopwatch.Frequency; // Ticks -> Microseconds
+
+                try
+                {
+                    var opts = new SessionOptions();
+                    if (provider == InferenceProvider.Cuda)
+                    {
+                        try { opts.AppendExecutionProvider_CUDA(0); } catch { Console.WriteLine("[ERR] CUDA Failed"); }
+                    }
+                    else if (provider == InferenceProvider.TensorRt)
+                    {
+                        try { opts.AppendExecutionProvider_Tensorrt(0); opts.AppendExecutionProvider_CUDA(0); } catch { }
+                    }
+                    else
+                    {
+                        opts.IntraOpNumThreads = 1;
+                        opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+                    }
+
+                    Session = new InferenceSession(path, opts);
+                    RunOpts = new RunOptions();
+                    IoBinding = Session.CreateIoBinding();
+
+                    // Alloc Input Buffer [Batch * Time * Channel]
+                    var inputBuffer = new float[batch * _strideFloats];
+
+                    // Pin Memory
+                    InputPin = GCHandle.Alloc(inputBuffer, GCHandleType.Pinned);
+                    OutputPin = GCHandle.Alloc(OutputBuffer, GCHandleType.Pinned);
+
+                    // Bind to ONNX Runtime
+                    var mem = OrtMemoryInfo.DefaultInstance;
+
+                    // Note: Check your model input shape. TCNs are often [Batch, Channels, Time] or [Batch, Time, Channels]
+                    // The line below assumes [Batch, Time, Channels] based on your transpose logic.
+                    // If your model is [Batch, Channels, Time], swap 'time' and 'channels' in the array below.
+                    var inOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inputBuffer), new long[] { batch, time, channels });
+
+                    var outOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(OutputBuffer), new long[] { batch, outSize / batch });
+
+                    IoBinding.BindInput(Session.InputMetadata.Keys.First(), inOrt);
+                    IoBinding.BindOutput(Session.OutputMetadata.Keys.First(), outOrt);
+
+                    inOrt.Dispose(); outOrt.Dispose();
+                }
+                catch (Exception ex) { Console.WriteLine($"[FATAL] {ex.Message}"); throw; }
+            }
+
+            public InferenceResult Execute(Mat m1)
+            {
+                _watch.Restart();
+
                 unsafe
                 {
-                    float* ptr = (float*)_inputPin.AddrOfPinnedObject();
-                    RobustTransposeCopy(input.Item1, ptr);
-                    RobustTransposeCopy(input.Item2, ptr + _batchStrideFloats);
+                    float* ptr = (float*)InputPin.AddrOfPinnedObject();
+                    TransposeToBuffer(m1, ptr);
                 }
-                return RunInference();
-            });
-        }
 
-        public IObservable<Mat> Process(IObservable<Mat> source)
-        {
-            return source.Select(input =>
+                var resMat = Run();
+                _watch.Stop();
+
+                return new InferenceResult { Output = resMat, LatencyMicroseconds = _watch.ElapsedTicks * _freqInv };
+            }
+
+            public InferenceResult ExecuteBatch(Mat m1, Mat m2)
             {
-                Initialise();
+                _watch.Restart();
+
                 unsafe
                 {
-                    RobustTransposeCopy(input, (float*)_inputPin.AddrOfPinnedObject());
+                    float* ptr = (float*)InputPin.AddrOfPinnedObject();
+                    TransposeToBuffer(m1, ptr);
+                    TransposeToBuffer(m2, ptr + _strideFloats);
                 }
-                return RunInference();
-            });
-        }
 
-        private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
-        {
-            byte* srcRowPtr = (byte*)src.Data.ToPointer();
-            int srcStep = src.Step;
-            for (int c = 0; c < Channels; c++)
+                var resMat = Run();
+                _watch.Stop();
+
+                return new InferenceResult { Output = resMat, LatencyMicroseconds = _watch.ElapsedTicks * _freqInv };
+            }
+
+            // Optimized Transpose: [Channels, Time] -> [Time, Channels]
+            private unsafe void TransposeToBuffer(Mat src, float* dstPtr)
             {
-                float* srcFloatRow = (float*)srcRowPtr;
-                for (int t = 0; t < TimePoints; t++)
+                float* srcPtr = (float*)src.Data.ToPointer();
+                int srcStep = src.Step / sizeof(float); // Stride in floats
+
+                int tMax = _time;
+                int cMax = _channels;
+
+                int dstIdx = 0;
+                // Outer loop Time, Inner loop Channels = [Time, Channels] layout
+                for (int t = 0; t < tMax; t++)
                 {
-                    dstBase[t * Channels + c] = srcFloatRow[t];
+                    for (int c = 0; c < cMax; c++)
+                    {
+                        // src is [Channels, Time], so index is (c * step) + t
+                        dstPtr[dstIdx++] = srcPtr[(c * srcStep) + t];
+                    }
                 }
-                srcRowPtr += srcStep;
             }
-        }
 
-        private Mat RunInference()
-        {
-            // 1. Snapshot GC State
-            int currentGcCount = GC.CollectionCount(0);
-            bool gcHappened = currentGcCount > _lastGcCount;
-            _lastGcCount = currentGcCount;
-
-            _benchmarker.Restart();
-
-            // 2. Run ONNX (Writes directly to _outputBuffer via IoBinding)
-            _session.RunWithBinding(_runOptions, _ioBinding);
-
-            // 3. Update the Reusable Mat
-            // Use Marshal.Copy to move data from the pinned float[] to the Mat's internal pointer.
-            // This is a memory-to-memory copy of ~1KB (negligible time) but avoids object creation.
-            unsafe
+            private Mat Run()
             {
-                Marshal.Copy(_outputBuffer, 0, _reusableOutputMat.Data, BatchSize);
+                // Zero-copy execution via IoBinding
+                Session.RunWithBinding(RunOpts, IoBinding);
+                return Mat.FromArray(OutputBuffer);
             }
 
-            _benchmarker.Stop();
-
-            // 4. Smart Logging (Only print spikes)
-            if (gcHappened || _benchmarker.Elapsed.TotalMilliseconds > 1.0)
+            public void Dispose()
             {
-                string log = $"SPIKE: {_benchmarker.Elapsed.TotalMilliseconds:F4} ms";
-                if (gcHappened) log += " <--- *** GARBAGE COLLECTION ***";
-                Console.WriteLine(log);
+                Session?.Dispose(); IoBinding?.Dispose(); RunOpts?.Dispose();
+                if (InputPin.IsAllocated) InputPin.Free();
+                if (OutputPin.IsAllocated) OutputPin.Free();
             }
-
-            return _reusableOutputMat;
-        }
-
-        public void Unload()
-        {
-            _reusableOutputMat?.Dispose();
-            _inputOrtValue?.Dispose();
-            _outputOrtValue?.Dispose();
-            if (_inputPin.IsAllocated) _inputPin.Free();
-            if (_outputPin.IsAllocated) _outputPin.Free();
-            _ioBinding?.Dispose();
-            _runOptions?.Dispose();
-            _session?.Dispose();
-            _session = null;
         }
     }
 }
