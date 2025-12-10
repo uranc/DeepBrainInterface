@@ -2,7 +2,7 @@
 using OpenCV.Net;
 using System;
 using System.ComponentModel;
-using System.Linq;
+using System.Diagnostics;
 using System.Reactive.Linq;
 
 namespace DeepBrainInterface
@@ -17,180 +17,275 @@ namespace DeepBrainInterface
         Ripple
     }
 
-    public class RippleOut
+    public sealed class RippleOut
     {
+        // Essential Logic Outputs
         public RippleState State { get; set; }
-        public float SignalProb { get; set; }
-        public float ArtifactProb { get; set; }
-        public bool IsArtifact { get; set; }
-        public bool Trigger { get; set; }      // True on Rising Edge
-        public bool GateOpen { get; set; }
+        public bool TTL { get; set; }          // High during Hold
 
-        // Data Pass-through (Optional)
+        // Accumulator Stats
+        public float Score { get; set; }       // Continuous Score
+        public int EventCount { get; set; }    // Total detected events
+
+        // Signal Data
+        public float Probability { get; set; }
+        public Mat SignalData { get; set; }    // Raw Data Snapshot (Cloned)
+
+        // Compatibility
         public int StrideUsed { get; set; }
-        public Mat SignalData { get; set; }    // Holds the raw 'sig' Mat
     }
 
     // ==============================================================================
     // 2. STATE MACHINE NODE
     // ==============================================================================
     [Combinator]
-    [Description("Schmitt Trigger State Machine. Supports 4 Overloads.")]
+    [Description("Accumulator FSM. Supports: (Mat), (Mat,Bool), ((Mat,Mat),Bool).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleStateMachineMatBool
+    public sealed class RippleStateMachineMatBool
     {
-        // ---- Thresholds ----
+        // ==============================================================================
+        // CONFIGURATION
+        // ==============================================================================
+
+        // ---- TOP LEVEL ----
+        [Category("General")]
+        [Description("Master switch. If False, output is NoRipple.")]
+        public bool DetectionEnabled { get; set; } = true;
+
+        // ---- THRESHOLDS ----
         [Category("Thresholds")]
-        [Description("Signal Probability > High -> Start Ripple")]
-        public float ThresholdHigh { get; set; } = 0.8f;
+        [DisplayName("0. Gate Threshold")]
+        [Description("Signal must exceed this to enter 'Possible' state.")]
+        public float GateThreshold { get; set; } = 0.10f;
 
         [Category("Thresholds")]
-        [Description("Signal Probability < Low -> End Ripple")]
-        public float ThresholdLow { get; set; } = 0.3f;
+        [DisplayName("1. First Threshold (Enter)")]
+        [Description("Adds +1.0 score per tick if signal > this.")]
+        public float EnterThreshold { get; set; } = 0.50f;
 
         [Category("Thresholds")]
-        [Description("Artifact Probability > Threshold -> IGNORE Signal")]
-        public float ArtifactThreshold { get; set; } = 0.5f;
+        [DisplayName("2. Second Threshold (Confirm)")]
+        [Description("Adds +2.0 score per tick if signal > this.")]
+        public float ConfirmThreshold { get; set; } = 0.80f;
 
-        // ---- Timing ----
-        [Category("Timing")]
-        [Description("Refractory period (samples) after ripple ends.")]
-        public int RefractorySamples { get; set; } = 50;
+        [Category("Thresholds")]
+        [DisplayName("3. Event Score Threshold")]
+        [Description("Target Score (multiplied internally) to trigger.")]
+        public float EventScoreThreshold { get; set; } = 2.5f;
 
-        // ---- Internal State ----
-        private bool _active;
-        private int _refractoryCounter;
+        // ---- SCORE DECAY ----
+        [Category("Score Decay")]
+        [DisplayName("Grace Samples")]
+        [Description("How long signal can hover before Score decays.")]
+        public int GraceSamples { get; set; } = 5;
+
+        [Category("Score Decay")]
+        [DisplayName("Grace Rate")]
+        [Description("Score subtracted per tick after Grace period.")]
+        public float GraceRate { get; set; } = 1.0f;
+
+        // ---- TTL OUTPUT ----
+        [Category("TTL Output")]
+        [DisplayName("Trigger Delay (ms)")]
+        [Description("Delay to wait AFTER detection before raising TTL.")]
+        public int TriggerDelayMs { get; set; } = 0;
+
+        [Category("TTL Output")]
+        [DisplayName("Post-Ripple Hold (ms)")]
+        [Description("Duration to hold TTL High after the Delay.")]
+        public int PostRippleMs { get; set; } = 50;
 
         // ==============================================================================
-        // CORE LOGIC (Public for External Calls)
+        // INTERNAL STATE
         // ==============================================================================
-        public RippleOut Update(float signal, float artifact, bool gateOpen, Mat signalData = null)
+        RippleState _state = RippleState.NoRipple;
+
+        float _scoreTicks;
+        int _ticksInPossible;
+        int _eventCount;
+
+        bool _ttlArmed;
+        long _ttlAtMs;
+        bool _ttlHolding;
+        long _ttlHoldUntilMs;
+
+        static readonly Stopwatch Clock = Stopwatch.StartNew();
+
+        // ==============================================================================
+        // CORE UPDATE LOOP
+        // ==============================================================================
+
+        public RippleOut Update(float signal, bool gateOpen, Mat rawInput = null)
         {
-            var outState = new RippleOut
+            long now = Clock.ElapsedMilliseconds;
+            Mat triggerSnapshot = null;
+
+            float reportingScore = _scoreTicks;
+
+            // 1. TTL HOLDING
+            if (_ttlHolding)
             {
-                SignalProb = signal,
-                ArtifactProb = artifact,
-                GateOpen = gateOpen,
-                IsArtifact = artifact > ArtifactThreshold,
-                StrideUsed = 0,
-                SignalData = signalData // <--- Carries the raw Mat
+                if (now >= _ttlHoldUntilMs)
+                {
+                    _ttlHolding = false;
+                    _state = RippleState.NoRipple;
+                    _scoreTicks = 0;
+                    _ticksInPossible = 0;
+                    reportingScore = 0;
+                }
+                else
+                {
+                    return Pack(signal, 0f, true, null);
+                }
+            }
+
+            // 2. TRIGGER DELAY
+            if (_ttlArmed)
+            {
+                if (now >= _ttlAtMs)
+                {
+                    _ttlArmed = false;
+                    _ttlHolding = true;
+                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
+                    triggerSnapshot = rawInput?.Clone(); // Safe Clone
+                    return Pack(signal, 0f, true, triggerSnapshot);
+                }
+                return Pack(signal, reportingScore, false, null);
+            }
+
+            // 3. MASTER GATING
+            bool allowed = DetectionEnabled && gateOpen;
+            if (!allowed)
+            {
+                _state = RippleState.NoRipple;
+                _scoreTicks = 0;
+                _ticksInPossible = 0;
+                return Pack(signal, 0f, false, null);
+            }
+
+            // 4. ACCUMULATOR FSM
+            float scoreTarget = EventScoreThreshold * 2.0f;
+
+            switch (_state)
+            {
+                case RippleState.NoRipple:
+                    if (signal >= GateThreshold)
+                    {
+                        _state = RippleState.Possible;
+                        _scoreTicks = 0;
+                        _ticksInPossible = 0;
+                    }
+                    reportingScore = 0f;
+                    break;
+
+                case RippleState.Possible:
+                    _ticksInPossible++;
+
+                    if (signal >= ConfirmThreshold) _scoreTicks += 2.0f;
+                    else if (signal >= EnterThreshold) _scoreTicks += 1.0f;
+
+                    reportingScore = _scoreTicks;
+
+                    if (_scoreTicks >= scoreTarget)
+                    {
+                        _state = RippleState.Ripple;
+                        _eventCount++;
+
+                        float peakScore = _scoreTicks;
+                        _scoreTicks = 0;
+                        _ticksInPossible = 0;
+
+                        if (TriggerDelayMs > 0)
+                        {
+                            _ttlArmed = true;
+                            _ttlAtMs = now + TriggerDelayMs;
+                            return Pack(signal, peakScore, false, null);
+                        }
+                        else
+                        {
+                            _ttlHolding = true;
+                            _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
+                            triggerSnapshot = rawInput?.Clone(); // Safe Clone
+                            return Pack(signal, peakScore, true, triggerSnapshot);
+                        }
+                    }
+                    else if (signal < GateThreshold)
+                    {
+                        _state = RippleState.NoRipple;
+                        _scoreTicks = 0;
+                        _ticksInPossible = 0;
+                        reportingScore = 0f;
+                    }
+                    else if (_ticksInPossible > GraceSamples)
+                    {
+                        _scoreTicks -= GraceRate;
+                        if (_scoreTicks < 0) _scoreTicks = 0;
+                        reportingScore = _scoreTicks;
+                    }
+                    break;
+
+                case RippleState.Ripple:
+                    if (signal < GateThreshold)
+                    {
+                        _state = RippleState.NoRipple;
+                        _scoreTicks = 0;
+                        reportingScore = 0f;
+                    }
+                    break;
+            }
+
+            return Pack(signal, reportingScore, _ttlHolding, triggerSnapshot);
+        }
+
+        private RippleOut Pack(float signal, float currentScore, bool ttl, Mat data)
+        {
+            return new RippleOut
+            {
+                State = _state,
+                Score = currentScore * 0.5f,
+                Probability = signal,
+                EventCount = _eventCount,
+                TTL = ttl,
+                SignalData = data,
+                StrideUsed = 0
             };
-
-            // 1. Gate & Artifact Check
-            if (!gateOpen || outState.IsArtifact)
-            {
-                _active = false;
-                _refractoryCounter = 0;
-                outState.State = RippleState.NoRipple;
-                return outState;
-            }
-
-            // 2. Refractory Check
-            if (_refractoryCounter > 0)
-            {
-                _refractoryCounter--;
-                _active = false;
-                outState.State = RippleState.NoRipple;
-                return outState;
-            }
-
-            // 3. Schmitt Trigger
-            if (_active)
-            {
-                // In Ripple -> Check if we drop below Low
-                if (signal < ThresholdLow)
-                {
-                    _active = false;
-                    _refractoryCounter = RefractorySamples;
-                    outState.State = RippleState.NoRipple;
-                }
-                else
-                {
-                    outState.State = RippleState.Ripple;
-                }
-            }
-            else
-            {
-                // No Ripple -> Check if we rise above High
-                if (signal > ThresholdHigh)
-                {
-                    _active = true;
-                    outState.State = RippleState.Ripple;
-                    outState.Trigger = true; // Rising Edge
-                }
-                else if (signal > ThresholdLow)
-                {
-                    outState.State = RippleState.Possible;
-                }
-                else
-                {
-                    outState.State = RippleState.NoRipple;
-                }
-            }
-
-            return outState;
         }
 
-        // Helper: Extract Signal/Artifact from a single Mat
-        private void ParseMat(Mat m, out float signal, out float artifact)
+        // ==============================================================================
+        // OVERLOADS
+        // ==============================================================================
+
+        // Helper
+        private float GetVal(Mat m)
         {
-            signal = 0; artifact = 0;
-            if (m == null) return;
-            unsafe
-            {
-                float* ptr = (float*)m.Data.ToPointer();
-                signal = ptr[0];
-
-                // If Mat has >1 element, Index 1 is Artifact
-                if ((m.Rows * m.Cols * m.Channels) > 1)
-                    artifact = ptr[1];
-            }
+            if (m == null) return 0f;
+            unsafe { return *((float*)m.Data.ToPointer()); }
         }
 
-        // ==============================================================================
-        // THE 4 OVERLOADS
-        // ==============================================================================
-
-        // 1. Mat Only
+        // 1. Mat Only (Gate=True, No Data)
         public IObservable<RippleOut> Process(IObservable<Mat> source)
         {
-            return source.Select(m =>
-            {
-                ParseMat(m, out float s, out float a);
-                return Update(s, a, true, null);
-            });
+            return source.Select(m => Update(GetVal(m), true, null));
         }
 
-        // 2. WithLatestFrom(Mat, Bool) -> Tuple<Mat, bool>
+        // 2. Mat + Bool (Prob, Gate) -> (No Data)
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
         {
-            return source.Select(t =>
-            {
-                ParseMat(t.Item1, out float s, out float a);
-                return Update(s, a, t.Item2, null);
-            });
+            return source.Select(t => Update(GetVal(t.Item1), t.Item2, null));
         }
 
-        // 3. Tuple(Mat, Mat) -> (SignalMat, ArtifactMat)
-        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
-        {
-            return source.Select(t =>
-            {
-                ParseMat(t.Item1, out float s, out _);
-                ParseMat(t.Item2, out float a, out _);
-                return Update(s, a, true, null);
-            });
-        }
-
-        // 4. WithLatestFrom(Tuple(Mat, Mat), Bool) -> Tuple<Tuple<Mat, Mat>, bool>
+        // 3. ((Mat, Mat), Bool) -> ((Prob, RawData), Gate)
+        // Wire: Zip(Prob, Raw) -> WithLatestFrom(Gate)
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
             return source.Select(t =>
             {
                 var mats = t.Item1;
-                ParseMat(mats.Item1, out float s, out _);
-                ParseMat(mats.Item2, out float a, out _);
-                return Update(s, a, t.Item2, null);
+                Mat prob = mats.Item1;
+                Mat raw = mats.Item2;
+                bool gate = t.Item2;
+
+                return Update(GetVal(prob), gate, raw);
             });
         }
     }

@@ -6,8 +6,6 @@ using System.ComponentModel;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
-// We remove the ambiguity by not using 'using System.Diagnostics;' for the class name
-// We will type the full name below.
 
 namespace DeepBrainInterface
 {
@@ -45,7 +43,7 @@ namespace DeepBrainInterface
                     source.Select(input =>
                     {
                         var mats = input.Item1;
-                        var bnoOk = input.Item2;
+                        var bnoOk = input.Item2; // This is now the MASTER GATE (BNO + Ext. Artifact)
 
                         // Pass to Engine -> Calls StateMachine -> Returns RippleOut
                         return engine.Execute(mats.Item1, mats.Item2, bnoOk, StateMachine, KBelowGate, KAtGate);
@@ -71,7 +69,6 @@ namespace DeepBrainInterface
 
             public AdaptiveEngine(string path, int channels, int time)
             {
-                // FIX: Use Fully Qualified Name to avoid collision with 'Process' method
                 try
                 {
                     System.Diagnostics.Process.GetCurrentProcess().PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
@@ -143,11 +140,11 @@ namespace DeepBrainInterface
                 _session.RunWithBinding(_runOpts, _binding);
 
                 float sigP = _outBuffer[0];
-                float artP = _outBuffer[1];
+                // float artP = _outBuffer[1]; // Calculated but ignored (Logic is upstream)
 
                 // D. Update State Machine
-                // PASS BY REF (sig) - DO NOT CLONE
-                var result = fsm.Update(sigP, artP, bnoOk, sig);
+                // Corrected Signature: Update(float signal, bool gateOpen, Mat rawInput)
+                var result = fsm.Update(sigP, bnoOk, sig);
 
                 // E. Adaptive Logic
                 _currentK = (result.State != RippleState.NoRipple) ? kAt : kBelow;
