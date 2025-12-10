@@ -3,16 +3,13 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics; // This namespace contains the 'Process' class
+using System.Drawing.Design;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Runtime.InteropServices;
-using System.Drawing.Design;
-using System.Windows.Forms.Design;
 using System.Runtime;     // For GCSettings
+using System.Runtime.InteropServices;
 
 namespace DeepBrainInterface
 {
@@ -70,7 +67,7 @@ namespace DeepBrainInterface
             {
                 // FIX IS HERE: Use "System.Diagnostics.Process" explicitly
                 // because your class has a method named "Process", confusing the compiler.
-                System.Diagnostics.Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
+                //System.Diagnostics.Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
 
                 // Tell .NET to delay garbage collection as long as possible
                 GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;

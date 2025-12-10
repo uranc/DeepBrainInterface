@@ -1,9 +1,9 @@
-﻿using System;
-using System.Numerics;
-using System.ComponentModel;
-using System.Reactive.Linq;
-using Bonsai;
+﻿using Bonsai;
 using OpenCV.Net;
+using System;
+using System.ComponentModel;
+using System.Numerics;
+using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {

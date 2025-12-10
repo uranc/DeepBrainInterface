@@ -1,10 +1,9 @@
-﻿using System;
-using System.Numerics;
-using System.Collections.Generic;
+﻿using Bonsai;
+using System;
 using System.ComponentModel;
 using System.Linq;
+using System.Numerics;
 using System.Reactive.Linq;
-using Bonsai;
 
 namespace DeepBrainInterface
 {

@@ -1,23 +1,18 @@
 ﻿using Bonsai;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Runtime;
 using System.Runtime.InteropServices;
-// Alias for Process to avoid collisions
-using SysProcess = System.Diagnostics.Process;
+// We remove the ambiguity by not using 'using System.Diagnostics;' for the class name
+// We will type the full name below.
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Adaptive Ripple Detector: Batch (1 or 2) + Stride Gate + Logic.")]
+    [Description("Adaptive Ripple Detector: High Priority. Zero-Copy Mode.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorAdaptive
     {
@@ -39,241 +34,153 @@ namespace DeepBrainInterface
         [Category("Stride")] public int KBelowGate { get; set; } = 5;
         [Category("Stride")] public int KAtGate { get; set; } = 1;
 
-        // Hardware Config
-        public enum InferenceProvider { Cpu, Cuda, TensorRt }
-        [Category("Hardware")] public InferenceProvider Provider { get; set; } = InferenceProvider.Cuda;
-        [Category("Hardware")] public int TargetCoreIndex { get; set; } = 4;
+        // --- PROCESS METHOD ---
 
-
-        // --- PROCESS METHODS (Infers Batch Size) ---
-
-        // Case 1: Batch = 2 (Signal + Artifact)
-        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, Mat>> source)
-        {
-            return Observable.Using(
-                () => CreateEngine(batchSize: 2),
-                (AdaptiveEngine engine) =>
-                    source.Where(_ => engine.CheckStride())
-                          .Select(input => engine.ExecuteBatch2(input.Item1, input.Item2, true, StateMachine, KBelowGate, KAtGate))
-            );
-        }
-
-        // Case 2: Batch = 2 (Signal + Artifact + Boolean Flag)
+        // Matches Workflow: Tuple< Tuple<Signal, Artifact>, BnoFlag >
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
             return Observable.Using(
-                () => CreateEngine(batchSize: 2),
+                () => new AdaptiveEngine(ModelPath, Channels, TimePoints),
                 (AdaptiveEngine engine) =>
-                    source.Where(_ => engine.CheckStride())
-                          .Select(input => engine.ExecuteBatch2(input.Item1.Item1, input.Item1.Item2, input.Item2, StateMachine, KBelowGate, KAtGate))
+                    source.Select(input =>
+                    {
+                        var mats = input.Item1;
+                        var bnoOk = input.Item2;
+
+                        // Pass to Engine -> Calls StateMachine -> Returns RippleOut
+                        return engine.Execute(mats.Item1, mats.Item2, bnoOk, StateMachine, KBelowGate, KAtGate);
+                    })
             );
-        }
-
-        // Case 3: Batch = 1 (Signal Only)
-        public IObservable<RippleOut> Process(IObservable<Mat> source)
-        {
-            return Observable.Using(
-                () => CreateEngine(batchSize: 1),
-                (AdaptiveEngine engine) =>
-                    source.Where(_ => engine.CheckStride())
-                          .Select(input => engine.ExecuteBatch1(input, true, StateMachine, KBelowGate, KAtGate))
-            );
-        }
-
-        // Case 4: Batch = 1 (Signal + Boolean Flag)
-        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
-        {
-            return Observable.Using(
-                () => CreateEngine(batchSize: 1),
-                (AdaptiveEngine engine) =>
-                    source.Where(_ => engine.CheckStride())
-                          .Select(input => engine.ExecuteBatch1(input.Item1, input.Item2, StateMachine, KBelowGate, KAtGate))
-            );
-        }
-
-        // --- FACTORY ---
-        private AdaptiveEngine CreateEngine(int batchSize)
-        {
-            // Apply CPU Locking
-            OptimizeThread(TargetCoreIndex);
-
-            return new AdaptiveEngine(ModelPath, Provider, batchSize, Channels, TimePoints);
-        }
-
-        private static void OptimizeThread(int coreIndex)
-        {
-            try
-            {
-                if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-                {
-                    SysProcess.GetCurrentProcess().ProcessorAffinity = new IntPtr(1 << coreIndex);
-                    SysProcess.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
-                    GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
-                }
-            }
-            catch { }
         }
 
         // --- ENGINE CLASS ---
-        public class AdaptiveEngine : IDisposable
+        private class AdaptiveEngine : IDisposable
         {
-            private InferenceSession Session;
-            private OrtIoBinding IoBinding;
-            private RunOptions RunOpts;
+            private InferenceSession _session;
+            private OrtIoBinding _binding;
+            private RunOptions _runOpts;
 
-            // Memory Pins
-            private GCHandle InputPin, OutputPin;
-            private float[] OutputBuffer;
-
-            // Dimensions
-            private int _time, _channels, _batch;
+            private GCHandle _inPin, _outPin;
+            private float[] _outBuffer;
             private int _strideFloats;
+            private int _channels, _time;
 
-            // Stride Logic State
-            private int _strideCounter;
+            // Stride State
+            private int _strideCounter = 0;
             private int _currentK = 1;
 
-            public AdaptiveEngine(string path, InferenceProvider provider, int batch, int channels, int time)
+            public AdaptiveEngine(string path, int channels, int time)
             {
+                // FIX: Use Fully Qualified Name to avoid collision with 'Process' method
+                try
+                {
+                    System.Diagnostics.Process.GetCurrentProcess().PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
+                }
+                catch { /* Ignore if permissions fail */ }
+
                 _time = time;
                 _channels = channels;
-                _batch = batch;
                 _strideFloats = time * channels;
 
-                // Assuming model outputs 1 float per batch item (Binary Classification)
-                OutputBuffer = new float[batch];
+                int batch = 2;
+                _outBuffer = new float[batch];
 
                 try
                 {
-                    // 1. Session Options (Optimized)
                     var opts = new SessionOptions();
-                    if (provider == InferenceProvider.Cuda)
-                    {
-                        try { opts.AppendExecutionProvider_CUDA(0); } catch { Console.WriteLine("[ERR] CUDA Failed"); }
-                    }
-                    else if (provider == InferenceProvider.TensorRt)
-                    {
-                        try { opts.AppendExecutionProvider_Tensorrt(0); opts.AppendExecutionProvider_CUDA(0); } catch { }
-                    }
-                    else
-                    {
-                        opts.IntraOpNumThreads = 1;
-                        opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
-                        opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
-                    }
-                    opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+                    opts.IntraOpNumThreads = 1;
+                    opts.InterOpNumThreads = 1;
+                    opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
 
-                    // 2. Init Session
-                    Session = new InferenceSession(path, opts);
-                    RunOpts = new RunOptions();
-                    IoBinding = Session.CreateIoBinding();
+                    _session = new InferenceSession(path, opts);
+                    _binding = _session.CreateIoBinding();
+                    _runOpts = new RunOptions();
 
-                    // 3. Pin Memory
                     var inputBuffer = new float[batch * _strideFloats];
-                    InputPin = GCHandle.Alloc(inputBuffer, GCHandleType.Pinned);
-                    OutputPin = GCHandle.Alloc(OutputBuffer, GCHandleType.Pinned);
+                    _inPin = GCHandle.Alloc(inputBuffer, GCHandleType.Pinned);
+                    _outPin = GCHandle.Alloc(_outBuffer, GCHandleType.Pinned);
 
-                    // 4. Bind Tensor Wrappers
                     var mem = OrtMemoryInfo.DefaultInstance;
 
-                    // Shape: [Batch, Time, Channels]
-                    var inOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inputBuffer), new long[] { batch, time, channels });
-                    var outOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(OutputBuffer), new long[] { batch, 1 }); // [Batch, 1]
-
-                    IoBinding.BindInput(Session.InputMetadata.Keys.First(), inOrt);
-                    IoBinding.BindOutput(Session.OutputMetadata.Keys.First(), outOrt);
-
-                    inOrt.Dispose(); outOrt.Dispose();
+                    using (var inOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inputBuffer), new long[] { batch, time, channels }))
+                    using (var outOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(_outBuffer), new long[] { batch, 1 }))
+                    {
+                        _binding.BindInput(_session.InputMetadata.Keys.First(), inOrt);
+                        _binding.BindOutput(_session.OutputMetadata.Keys.First(), outOrt);
+                    }
                 }
                 catch (Exception ex) { Console.WriteLine($"[FATAL] {ex.Message}"); throw; }
             }
 
-            // --- STRIDE LOGIC ---
-            public bool CheckStride()
+            public RippleOut Execute(Mat sig, Mat art, bool bnoOk, RippleStateMachineMatBool fsm, int kBelow, int kAt)
             {
-                if (_currentK <= 1) return true;
-                _strideCounter++;
-                if (_strideCounter >= _currentK)
+                // A. Stride Logic (Gate)
+                if (_currentK > 1)
                 {
+                    _strideCounter++;
+                    if (_strideCounter < _currentK)
+                    {
+                        // SKIPPED FRAME: Return dummy result
+                        return new RippleOut
+                        {
+                            State = RippleState.NoRipple,
+                            StrideUsed = _currentK,
+                            SignalData = sig // Pass ref to keep visualization alive
+                        };
+                    }
                     _strideCounter = 0;
-                    return true;
                 }
-                return false;
-            }
 
-            // --- EXECUTION BATCH 1 ---
-            public RippleOut ExecuteBatch1(Mat signal, bool bnoOk, RippleStateMachineMatBool fsm, int kBelow, int kAt)
-            {
+                // B. Data Copy (Fast / Unsafe)
                 unsafe
                 {
-                    // Zero-copy Transpose
-                    TransposeToBuffer(signal, (float*)InputPin.AddrOfPinnedObject());
+                    float* ptr = (float*)_inPin.AddrOfPinnedObject();
+                    CopyMat(sig, ptr);
+                    CopyMat(art, ptr + _strideFloats);
                 }
 
-                Session.RunWithBinding(RunOpts, IoBinding);
+                // C. Inference
+                _session.RunWithBinding(_runOpts, _binding);
 
-                // Read Result directly from pinned buffer
-                float sigP = OutputBuffer[0];
-                float artP = 0f; // No artifact input
+                float sigP = _outBuffer[0];
+                float artP = _outBuffer[1];
 
-                // Update Logic
-                var rippleOut = fsm.Update(sigP, artP, bnoOk, signal);
+                // D. Update State Machine
+                // PASS BY REF (sig) - DO NOT CLONE
+                var result = fsm.Update(sigP, artP, bnoOk, sig);
 
-                // Update Stride for next frame
-                _currentK = (rippleOut.State != RippleState.NoRipple) ? kAt : kBelow;
-                rippleOut.StrideUsed = _currentK;
+                // E. Adaptive Logic
+                _currentK = (result.State != RippleState.NoRipple) ? kAt : kBelow;
+                result.StrideUsed = _currentK;
 
-                return rippleOut;
+                return result;
             }
 
-            // --- EXECUTION BATCH 2 ---
-            public RippleOut ExecuteBatch2(Mat signal, Mat artifact, bool bnoOk, RippleStateMachineMatBool fsm, int kBelow, int kAt)
-            {
-                unsafe
-                {
-                    float* ptr = (float*)InputPin.AddrOfPinnedObject();
-                    TransposeToBuffer(signal, ptr);
-                    TransposeToBuffer(artifact, ptr + _strideFloats); // Offset by 1 batch item
-                }
-
-                Session.RunWithBinding(RunOpts, IoBinding);
-
-                float sigP = OutputBuffer[0];
-                float artP = OutputBuffer[1];
-
-                var rippleOut = fsm.Update(sigP, artP, bnoOk, signal);
-
-                // Update Stride for next frame
-                _currentK = (rippleOut.State != RippleState.NoRipple) ? kAt : kBelow;
-                rippleOut.StrideUsed = _currentK;
-
-                return rippleOut;
-            }
-
-            // Optimized Transpose
-            private unsafe void TransposeToBuffer(Mat src, float* dstPtr)
+            private unsafe void CopyMat(Mat src, float* dst)
             {
                 float* srcPtr = (float*)src.Data.ToPointer();
                 int srcStep = src.Step / sizeof(float);
 
-                int tMax = _time;
                 int cMax = _channels;
-
+                int tMax = _time;
                 int dstIdx = 0;
+
                 for (int t = 0; t < tMax; t++)
                 {
                     for (int c = 0; c < cMax; c++)
                     {
-                        dstPtr[dstIdx++] = srcPtr[(c * srcStep) + t];
+                        dst[dstIdx++] = srcPtr[c * srcStep + t];
                     }
                 }
             }
 
             public void Dispose()
             {
-                Session?.Dispose(); IoBinding?.Dispose(); RunOpts?.Dispose();
-                if (InputPin.IsAllocated) InputPin.Free();
-                if (OutputPin.IsAllocated) OutputPin.Free();
+                _session?.Dispose();
+                _binding?.Dispose();
+                _runOpts?.Dispose();
+                if (_inPin.IsAllocated) _inPin.Free();
+                if (_outPin.IsAllocated) _outPin.Free();
             }
         }
     }

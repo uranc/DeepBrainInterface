@@ -8,7 +8,7 @@ namespace DeepBrainInterface
 {
     [Description("Sliding-window z-score over the last WindowSize samples (per channel). " +
                  "Keeps exactly WindowSize points and recomputes mean/variance in O(Channels) each step.")]
-    public class SlidingWindowZScore: Transform<Mat, Mat>
+    public class SlidingWindowZScore : Transform<Mat, Mat>
     {
         // How many most recent samples to use for mean/variance
         private int _windowSize = 1250;

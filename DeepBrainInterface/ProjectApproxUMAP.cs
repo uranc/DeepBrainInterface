@@ -7,7 +7,6 @@ using System.Drawing.Design;
 using System.IO;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
-using System.Windows.Forms.Design; // Ensure System.Design is referenced
 
 namespace DeepBrainInterface
 {

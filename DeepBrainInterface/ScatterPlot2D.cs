@@ -1,12 +1,12 @@
-﻿using System;
+﻿using Bonsai;
+using OpenCV.Net;
+using System;
 using System.ComponentModel;
 using System.Drawing;
-using System.Threading;
-using System.Windows.Forms;
-using Bonsai;
-using OpenCV.Net;
 using System.Reactive.Disposables;
 using System.Reactive.Linq;
+using System.Threading;
+using System.Windows.Forms;
 using ZedGraph;
 
 namespace DeepBrainInterface
