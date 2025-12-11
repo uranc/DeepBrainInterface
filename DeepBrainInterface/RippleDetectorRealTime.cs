@@ -3,18 +3,19 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
-using System.Drawing.Design;
+using System.Diagnostics;
+using System.Drawing.Design; // Required for UITypeEditor
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Runtime;     // For GCSettings
 using System.Runtime.InteropServices;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("High-Performance ONNX Inference (Strict Batch 1 or 2, Pinned Memory).")]
+    [Description("CPU Inference: Single-Threaded. Merges inputs. Strict BatchSize check.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorRealTime
     {
@@ -22,239 +23,189 @@ namespace DeepBrainInterface
         // 1. CONFIGURATION
         // ==============================================================================
         [Category("Model")]
-        [Editor(typeof(FileNameEditor), typeof(UITypeEditor))]
-        public string ModelPath { get; set; } = @"ripple_detector.onnx";
+        [DisplayName("Model Path")]
+        [Description("Path to the ONNX model file.")]
+        [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
+        [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
+        public string ModelPath { get; set; } = @"C:\DeepBrain\Models\ripple_detector.onnx";
 
-        [Category("Model")]
-        [Description("Strictly 1 (Signal) or 2 (Signal + Artifact).")]
+        // ---- DIMENSIONS (PRE-ALLOCATION) ----
+        [Category("Dimensions")]
+        [Description("Strict Batch Size. Input Tuple size MUST match this.")]
         public int BatchSize { get; set; } = 2;
 
-        [Category("Model")]
+        [Category("Dimensions")]
+        [Description("Time points per input sample.")]
         public int TimePoints { get; set; } = 44;
 
-        [Category("Model")]
+        [Category("Dimensions")]
+        [Description("Channels per input sample.")]
         public int Channels { get; set; } = 8;
 
         // ==============================================================================
-        // 2. INTERNAL RESOURCES
+        // INTERNAL STATE
         // ==============================================================================
         private InferenceSession _session;
-        private OrtIoBinding _ioBinding;
-        private RunOptions _runOptions;
+        private OrtIoBinding _binding;
+        private RunOptions _runOpts;
 
-        // Fixed Pinned Memory (Prevent GC movement)
-        private GCHandle _inputPin;
-        private GCHandle _outputPin;
-        private OrtValue _inputOrtValue;
-        private OrtValue _outputOrtValue;
+        private GCHandle _hInput, _hOutput;
+        private float[] _outputBuffer;
 
-        // Buffers
-        private float[] _outputBuffer; // Managed array for result copying
-        private int _batchStrideFloats; // Floats per batch item
+        // Caching sizes for fast copy
+        private int _inputStrideFloats;
+        private int _inputStrideBytes;
+        private int _outputCols;
 
-        // NEW: Reusable Output Matrix (Zero-Allocation)
-        private Mat _reusableOutputMat;
-
-        private void Initialise()
+        // ==============================================================================
+        // INITIALIZATION
+        // ==============================================================================
+        private void Initialize()
         {
             if (_session != null) return;
             if (!File.Exists(ModelPath)) throw new FileNotFoundException("Model not found", ModelPath);
 
-            // ------------------------------------------------------------
-            // NEW: SYSTEM OPTIMIZATIONS (RealTime & GC)
-            // ------------------------------------------------------------
+            // 1. Force Single-Threaded CPU
+            var opts = new SessionOptions
+            {
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                IntraOpNumThreads = 1,
+                InterOpNumThreads = 1,
+                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING
+            };
+
+            // 2. Create Session
             try
             {
-                // FIX IS HERE: Use "System.Diagnostics.Process" explicitly
-                // because your class has a method named "Process", confusing the compiler.
-                //System.Diagnostics.Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
-
-                // Tell .NET to delay garbage collection as long as possible
-                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+                _session = new InferenceSession(ModelPath, opts);
+                _binding = _session.CreateIoBinding();
+                _runOpts = new RunOptions();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Warning] Optimization Failed: {ex.Message}");
+                throw new Exception($"Failed to load model at {ModelPath}. {ex.Message}");
             }
-            // ------------------------------------------------------------
 
-            // A. PERFORMANCE TWEAKS & SESSION CONFIG
-            var opts = new SessionOptions
+            // 3. Pre-Calculate Strides
+            _inputStrideFloats = TimePoints * Channels;
+            _inputStrideBytes = _inputStrideFloats * sizeof(float);
+
+            // 4. Allocate Input Buffer (Pinned)
+            long[] inShape = new long[] { (long)BatchSize, (long)TimePoints, (long)Channels };
+            float[] inBuffer = new float[BatchSize * _inputStrideFloats];
+            _hInput = GCHandle.Alloc(inBuffer, GCHandleType.Pinned);
+
+            // 5. Determine Output Shape (Fixing int[] -> long[] conversion)
+            var outMeta = _session.OutputMetadata.First();
+            int[] dimInts = outMeta.Value.Dimensions;
+
+            long[] outShape = new long[dimInts.Length];
+            for (int i = 0; i < dimInts.Length; i++)
             {
-                // Critical: Force single-threaded execution to prevent overhead
-                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-                IntraOpNumThreads = 1,
-                InterOpNumThreads = 1,
-                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                EnableCpuMemArena = true
-            };
+                outShape[i] = (long)dimInts[i];
+            }
 
-            // Critical: Treat tiny floats (denormals) as zero. 
-            // Prevents massive CPU spikes on silence/baseline signals.
-            opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+            // Fix dynamic batch dimension if present
+            if (outShape[0] <= 0) outShape[0] = (long)BatchSize;
 
-            // Critical: Stop ONNX from busy-waiting (spinning) on the CPU
-            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
+            // Get number of columns (e.g. 1 for prob only, 2 for prob+artifact)
+            _outputCols = (int)outShape[outShape.Length - 1];
 
-            _session = new InferenceSession(ModelPath, opts);
-            _ioBinding = _session.CreateIoBinding();
-            _runOptions = new RunOptions();
-
-            // B. SIZE CALCULATION
-            // Model Expects: [Batch, Time, Channels] -> [Batch, 44, 8]
-            // Input comes as: [Channels, Time] -> [8, 44] (Must Transpose)
-            _batchStrideFloats = TimePoints * Channels;
-            int totalInputFloats = BatchSize * _batchStrideFloats;
-            int totalOutputFloats = BatchSize; // [Batch, 1]
-
-            // C. PINNED ALLOCATION (Zero Copy Lifecycle)
-            var inputData = new float[totalInputFloats];
-            _inputPin = GCHandle.Alloc(inputData, GCHandleType.Pinned);
+            long totalOutputFloats = 1;
+            foreach (long dim in outShape) totalOutputFloats *= dim;
 
             _outputBuffer = new float[totalOutputFloats];
-            _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
+            _hOutput = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
 
-            // NEW: Pre-allocate the OpenCV Matrix once
-            _reusableOutputMat = new Mat(BatchSize, 1, Depth.F32, 1);
-
-            // D. BINDING (Zero Copy Inference)
+            // 6. Bind Buffers (Zero-Copy)
             var memInfo = OrtMemoryInfo.DefaultInstance;
-            unsafe
+
+            using (var inOrt = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(inBuffer), inShape))
+            using (var outOrt = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_outputBuffer), outShape))
             {
-                // Bind Input
-                _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, TimePoints, Channels },
-                    _inputPin.AddrOfPinnedObject(),
-                    totalInputFloats * sizeof(float)
-                );
-
-                // Bind Output
-                _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                    memInfo, TensorElementType.Float,
-                    new long[] { BatchSize, 1 },
-                    _outputPin.AddrOfPinnedObject(),
-                    _outputBuffer.Length * sizeof(float)
-                );
+                _binding.BindInput(_session.InputMetadata.Keys.First(), inOrt);
+                _binding.BindOutput(_session.OutputMetadata.Keys.First(), outOrt);
             }
-
-            _ioBinding.BindInput(_session.InputMetadata.Keys.First(), _inputOrtValue);
-            _ioBinding.BindOutput(_session.OutputMetadata.Keys.First(), _outputOrtValue);
 
             // Warmup
-            _session.RunWithBinding(_runOptions, _ioBinding);
+            _session.RunWithBinding(_runOpts, _binding);
         }
 
         // ==============================================================================
-        // 3. PROCESSING (High Performance Overloads)
+        // CORE PROCESSING
         // ==============================================================================
-
-        // Scenario: Batch Size 2 (Signal + Artifact)
-        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
+        private Mat ProcessInputs(params Mat[] inputs)
         {
-            return source.Select(input =>
+            Initialize();
+
+            // STRICT VALIDATION
+            if (inputs.Length != BatchSize)
             {
-                Initialise();
-                if (BatchSize != 2) throw new InvalidOperationException("Model Configured for Batch 2, but received Tuple.");
-
-                unsafe
-                {
-                    float* ptr = (float*)_inputPin.AddrOfPinnedObject();
-
-                    // 1. Transpose First Mat (Signal) -> Buffer Index 0
-                    RobustTransposeCopy(input.Item1, ptr);
-
-                    // 2. Transpose Second Mat (Artifact) -> Buffer Index 352 (44*8)
-                    RobustTransposeCopy(input.Item2, ptr + _batchStrideFloats);
-                }
-
-                return RunInference();
-            });
-        }
-
-        // Scenario: Batch Size 1 (Signal Only)
-        public IObservable<Mat> Process(IObservable<Mat> source)
-        {
-            return source.Select(input =>
-            {
-                Initialise();
-                if (BatchSize != 1) throw new InvalidOperationException("Model Configured for Batch 1, but received Single Mat.");
-
-                unsafe
-                {
-                    // Transpose Mat -> Buffer Index 0
-                    RobustTransposeCopy(input, (float*)_inputPin.AddrOfPinnedObject());
-                }
-
-                return RunInference();
-            });
-        }
-
-        // ==============================================================================
-        // 4. CORE LOGIC (Robust Memory Ops)
-        // ==============================================================================
-
-        // Converts 8x44 (Input) -> 44x8 (Model) safely handling padding/ROIs
-        private unsafe void RobustTransposeCopy(Mat src, float* dstBase)
-        {
-            // Strict Dimensions Check
-            if (src.Rows != Channels || src.Cols != TimePoints)
-                throw new InvalidOperationException($"Input Mat must be {Channels}x{TimePoints}. Got {src.Rows}x{src.Cols}");
-
-            byte* srcRowPtr = (byte*)src.Data.ToPointer();
-            int srcStep = src.Step; // Stride in bytes (handles padding/ROIs)
-
-            // Loop Input Rows (Channels = 8)
-            for (int c = 0; c < Channels; c++)
-            {
-                float* srcFloatRow = (float*)srcRowPtr;
-
-                // Loop Input Cols (Time = 44)
-                for (int t = 0; t < TimePoints; t++)
-                {
-                    // Transpose mapping:
-                    // Input:  [Channel, Time]
-                    // Output: [Time, Channel] (Linear Index: t * 8 + c)
-                    dstBase[t * Channels + c] = srcFloatRow[t];
-                }
-
-                // Advance to next row safely using Step
-                srcRowPtr += srcStep;
+                throw new InvalidOperationException($"Input count ({inputs.Length}) does not match configured BatchSize ({BatchSize}).");
             }
-        }
 
-        private Mat RunInference()
-        {
-            // 1. Execute (Zero-Copy)
-            // Input data is already at the pinned location via RobustTransposeCopy
-            // Output will be written directly to _outputBuffer
-            _session.RunWithBinding(_runOptions, _ioBinding);
-
-            // 2. Result (Zero Allocation)
-            // We reuse the pre-allocated Mat. 
-            // We simply copy the raw floats from our buffer into the Mat's data pointer.
             unsafe
             {
-                Marshal.Copy(_outputBuffer, 0, _reusableOutputMat.Data, BatchSize);
+                float* dstBase = (float*)_hInput.AddrOfPinnedObject();
+
+                // 1. LOOP & MERGE
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    Mat m = inputs[i];
+                    float* src = (float*)m.Data.ToPointer();
+
+                    // Direct Memory Copy
+                    Buffer.MemoryCopy(src, dstBase + (i * _inputStrideFloats), _inputStrideBytes, _inputStrideBytes);
+                }
             }
 
-            // Return the reuseable object.
-            // CAUTION: Downstream nodes must consume this immediately or Clone() it,
-            // because the data inside this Mat will change on the very next frame.
-            return _reusableOutputMat;
+            // 2. RUN INFERENCE
+            _session.RunWithBinding(_runOpts, _binding);
+
+            // 3. RETURN OUTPUT
+            // Rows = BatchSize, Cols = OutputCols.
+            var resultMat = new Mat(BatchSize, _outputCols, Depth.F32, 1);
+            Marshal.Copy(_outputBuffer, 0, resultMat.Data, _outputBuffer.Length);
+
+            return resultMat;
         }
 
-        public void Unload()
+        // ==============================================================================
+        // OVERLOADS (2, 3, 4 Inputs)
+        // ==============================================================================
+
+        // 1. Single Input
+        public IObservable<Mat> Process(IObservable<Mat> source)
         {
-            _reusableOutputMat?.Dispose(); // Dispose the reusable Mat
-            _inputOrtValue?.Dispose();
-            _outputOrtValue?.Dispose();
-            if (_inputPin.IsAllocated) _inputPin.Free();
-            if (_outputPin.IsAllocated) _outputPin.Free();
-            _ioBinding?.Dispose();
-            _runOptions?.Dispose();
+            return source.Select(m => ProcessInputs(m));
+        }
+
+        // 2. Pair
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
+        {
+            return source.Select(t => ProcessInputs(t.Item1, t.Item2));
+        }
+
+        // 3. Triplet
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat, Mat>> source)
+        {
+            return source.Select(t => ProcessInputs(t.Item1, t.Item2, t.Item3));
+        }
+
+        // 4. Quad
+        public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat, Mat, Mat>> source)
+        {
+            return source.Select(t => ProcessInputs(t.Item1, t.Item2, t.Item3, t.Item4));
+        }
+
+        // Cleanup
+        public void Dispose()
+        {
+            if (_hInput.IsAllocated) _hInput.Free();
+            if (_hOutput.IsAllocated) _hOutput.Free();
+            _binding?.Dispose();
             _session?.Dispose();
-            _session = null;
         }
     }
 }
