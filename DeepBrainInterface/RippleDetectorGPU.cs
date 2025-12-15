@@ -11,7 +11,7 @@ using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 
-// --- FIXED: Alias must be at the top level or immediately inside the namespace ---
+// Alias for zero-allocation return
 using PredictionResult = System.ValueTuple<OpenCV.Net.Mat, double>;
 
 namespace DeepBrainInterface
@@ -19,7 +19,7 @@ namespace DeepBrainInterface
     public enum OnnxProvider { Cpu, Cuda, TensorRT }
 
     [Combinator]
-    [Description("High-Performance GPU Inference. Zero-Allocation Mode.")]
+    [Description("High-Performance GPU Inference. Returns (PredictionMat, DurationMs).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorGPU : IDisposable
     {
@@ -32,10 +32,32 @@ namespace DeepBrainInterface
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
         [Category("Settings")]
+        [Description("Execution Provider (GPU/CPU).")]
         public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
 
         [Category("Settings")]
+        [Description("GPU Device ID (usually 0).")]
         public int DeviceId { get; set; } = 0;
+
+        [Category("Settings")]
+        [Description("Intra-Op Threads: Parallelizes single operators. 1 is best for low latency.")]
+        public int IntraOpNumThreads { get; set; } = 1;
+
+        [Category("Settings")]
+        [Description("Inter-Op Threads: Runs graph nodes in parallel. Keep 1 for sequential.")]
+        public int InterOpNumThreads { get; set; } = 1;
+
+        [Category("Optimizations")]
+        [Description("Forces execution on Cores 0-7 (P-Cores). Fixes latency on Intel 12th/13th/14th Gen Hybrid CPUs.")]
+        public bool PinToPCores { get; set; } = false;
+
+        [Category("Optimizations")]
+        [Description("Allows the CPU to busy-wait (spin) for tasks. Reduces latency but increases CPU usage.")]
+        public bool AllowSpinning { get; set; } = true;
+
+        [Category("Dimensions")]
+        [Description("Number of samples to process in parallel.")]
+        public int BatchSize { get; set; } = 2;
 
         [Category("Dimensions")]
         public int TimePoints { get; set; } = 92;
@@ -46,60 +68,84 @@ namespace DeepBrainInterface
 
         // Resources
         private InferenceSession _session;
-        private OrtIoBinding _binding;
-        private RunOptions _runOptions;
-        private OrtMemoryInfo _memInfo;
+        private string _inputName;
         private Stopwatch _timer = new Stopwatch();
 
-        // Buffers
-        private float[] _inputBuffer;
-        private GCHandle _inputPin;
-        private OrtValue _inputOrtValue;
+        // DenseTensor buffers
+        private float[] _buffer;
+        private GCHandle _bufferPin;
+        private List<NamedOnnxValue> _inputs = new List<NamedOnnxValue>(1);
 
-        private float[] _outputBuffer;
-        private GCHandle _outputPin;
-        private OrtValue _outputOrtValue;
+        // Dimensions
+        private int _inputStride;
+        private int _activeBatchSize;
 
-        // Caching for Zero-Allocation
-        private int _currentCapacity = 0;
-        private int _activeBatchSize = 0;
-        private string _inputName, _outputName;
+        // Input cache
+        private readonly List<Mat> _inputBatch = new List<Mat>(4);
 
-        // 1. Reusable Output Mat to prevent 5-10ms GC spikes
-        private Mat _cachedOutputMat;
-
-        // 2. Reusable List wrapper to prevent array allocation on single inputs
-        private readonly List<Mat> _singleInputBatch = new List<Mat>(1);
-
-        private void InitializeSession()
+        private void InitializeSession(int batchSize)
         {
-            if (_session != null) return;
+            if (_session != null && _activeBatchSize == batchSize) return;
+            if (_session != null) Dispose();
 
-            // 1. PERFORMANCE CORE OPTIMIZATION (Safe Priority)
-            // Request High priority to target P-Cores, but avoid RealTime to prevent lockups.
+            _activeBatchSize = batchSize;
+            _inputStride = TimePoints * Channels;
+
+            // 1. CPU & THREAD OPTIMIZATIONS
             try
             {
                 using (var proc = System.Diagnostics.Process.GetCurrentProcess())
                 {
+                    // A. High Priority
                     if (proc.PriorityClass != System.Diagnostics.ProcessPriorityClass.High)
-                    {
                         proc.PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
+
+                    // B. P-Core Pinning
+                    if (PinToPCores)
+                    {
+                        long affinityMask = (long)proc.ProcessorAffinity;
+                        long pCoreMask = 0xFF;
+
+                        if ((affinityMask & pCoreMask) == pCoreMask)
+                        {
+                            proc.ProcessorAffinity = (IntPtr)pCoreMask;
+                        }
                     }
                 }
             }
-            catch { /* Ignore permissions errors if run as non-admin */ }
+            catch { }
 
-            // 2. ANTI-FREEZE THREADING
-            // Limiting to 1 thread while on High Priority effectively locks this to 
-            // a single P-Core, leaving the rest of the CPU free for Windows/UI.
+            // 2. Allocate Buffer
+            _buffer = new float[_activeBatchSize * _inputStride];
+            _bufferPin = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
+
+            // 3. Configure Session Options
             var opts = new SessionOptions
             {
-                IntraOpNumThreads = 1,
-                InterOpNumThreads = 1,
+                IntraOpNumThreads = IntraOpNumThreads,
+                InterOpNumThreads = InterOpNumThreads,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING
+                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
+                EnableCpuMemArena = true
             };
 
+            // Critical Parity Settings
+            opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
+            opts.AddSessionConfigEntry("session.enable_mem_pattern", "1");
+            opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
+            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested"); // Fixed typo 'options' -> 'opts'
+
+            // Latency Optimization (Spinning)
+            if (AllowSpinning)
+            {
+                opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "1");
+            }
+            else
+            {
+                opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
+            }
+
+            // 4. Set Provider
             try
             {
                 if (Provider == OnnxProvider.TensorRT)
@@ -113,130 +159,112 @@ namespace DeepBrainInterface
                     opts.AppendExecutionProvider_CUDA(DeviceId);
                 }
             }
-            catch
-            {
-                Provider = OnnxProvider.Cpu;
-            }
+            catch { Provider = OnnxProvider.Cpu; }
 
             _session = new InferenceSession(ModelPath, opts);
-            _memInfo = OrtMemoryInfo.DefaultInstance;
-            _binding = _session.CreateIoBinding();
-            _runOptions = new RunOptions();
             _inputName = _session.InputMetadata.Keys.First();
-            _outputName = _session.OutputMetadata.Keys.First();
             opts.Dispose();
+
+            // Warmup
+            var warmup = new DenseTensor<float>(_buffer, new[] { _activeBatchSize, TimePoints, Channels });
+            using (var _ = _session.Run(new[] { NamedOnnxValue.CreateFromTensor(_inputName, warmup) })) { }
         }
 
-        private void PrepareBinding(int batchSize)
+        private DenseTensor<float> BuildTensor(IList<Mat> mats)
         {
-            InitializeSession();
-
-            // Resize buffers if needed
-            if (batchSize > _currentCapacity)
+            unsafe
             {
-                if (_inputPin.IsAllocated) _inputPin.Free();
-                if (_outputPin.IsAllocated) _outputPin.Free();
+                float* dstBase = (float*)_bufferPin.AddrOfPinnedObject().ToPointer();
 
-                _currentCapacity = Math.Max(batchSize, _currentCapacity);
+                for (int i = 0; i < mats.Count; i++)
+                {
+                    float* src = (float*)mats[i].Data.ToPointer();
+                    float* dst = dstBase + (i * _inputStride);
 
-                _inputBuffer = new float[_currentCapacity * TimePoints * Channels];
-                _inputPin = GCHandle.Alloc(_inputBuffer, GCHandleType.Pinned);
-
-                _outputBuffer = new float[_currentCapacity];
-                _outputPin = GCHandle.Alloc(_outputBuffer, GCHandleType.Pinned);
-
-                // Reset Cached Output Mat since capacity changed
-                _cachedOutputMat = null;
+                    // CASE A: Perfect Match [Time x Channel]
+                    if (mats[i].Rows == TimePoints && mats[i].Cols == Channels)
+                    {
+                        Buffer.MemoryCopy(src, dst, _inputStride * sizeof(float), _inputStride * sizeof(float));
+                    }
+                    // CASE B: Transpose Needed [Channel x Time]
+                    else if (mats[i].Rows == Channels && mats[i].Cols == TimePoints)
+                    {
+                        for (int c = 0; c < Channels; c++)
+                            for (int t = 0; t < TimePoints; t++)
+                                dst[(t * Channels) + c] = src[(c * TimePoints) + t];
+                    }
+                    else
+                    {
+                        throw new ArgumentException($"Invalid Mat Shape: {mats[i].Rows}x{mats[i].Cols}. Expected {TimePoints}x{Channels}.");
+                    }
+                }
             }
+            return new DenseTensor<float>(_buffer, new[] { _activeBatchSize, TimePoints, Channels });
+        }
 
-            // Re-bind tensors if batch size changes or capacity grew
-            if (batchSize != _activeBatchSize || batchSize > _currentCapacity)
+        private PredictionResult RunInference(IList<Mat> mats)
+        {
+            int currentBatch = mats.Count;
+            if (currentBatch == 0) return (null, 0);
+
+            InitializeSession(currentBatch);
+
+            var tensor = BuildTensor(mats);
+            var named = NamedOnnxValue.CreateFromTensor(_inputName, tensor);
+
+            _inputs.Clear();
+            _inputs.Add(named);
+
+            _timer.Restart();
+
+            // Output Allocation
+            var resultMat = new Mat(1, 1, Depth.F32, currentBatch);
+
+            using (var results = _session.Run(_inputs))
             {
-                _inputOrtValue?.Dispose();
-                _outputOrtValue?.Dispose();
+                _timer.Stop();
+                var outTensor = results.First().AsTensor<float>();
 
                 unsafe
                 {
-                    long[] inShape = { batchSize, TimePoints, Channels };
-                    long[] outShape = { batchSize, 1 };
-
-                    _inputOrtValue = OrtValue.CreateTensorValueWithData(
-                        _memInfo,
-                        TensorElementType.Float,
-                        inShape,
-                        _inputPin.AddrOfPinnedObject(),
-                        batchSize * TimePoints * Channels * sizeof(float));
-
-                    _outputOrtValue = OrtValue.CreateTensorValueWithData(
-                        _memInfo,
-                        TensorElementType.Float,
-                        outShape,
-                        _outputPin.AddrOfPinnedObject(),
-                        batchSize * sizeof(float));
-                }
-
-                _binding.ClearBoundInputs();
-                _binding.BindInput(_inputName, _inputOrtValue);
-                _binding.ClearBoundOutputs();
-                _binding.BindOutput(_outputName, _outputOrtValue);
-
-                _activeBatchSize = batchSize;
-
-                // Create/Resize the Reusable Output Mat ONCE
-                _cachedOutputMat = new Mat(batchSize, 1, Depth.F32, 1);
-            }
-        }
-
-        // Optimized Inference Method
-        private PredictionResult RunInference(IList<Mat> mats)
-        {
-            int batchSize = mats.Count;
-            if (batchSize == 0) return (null, 0);
-
-            PrepareBinding(batchSize);
-
-            // 1. Copy Data (Unsafe Pointer Copy is fastest)
-            unsafe
-            {
-                float* dstBase = (float*)_inputPin.AddrOfPinnedObject().ToPointer();
-                int stride = TimePoints * Channels;
-                long bytesPerMat = stride * sizeof(float);
-
-                for (int i = 0; i < batchSize; i++)
-                {
-                    float* src = (float*)mats[i].Data.ToPointer();
-                    Buffer.MemoryCopy(src, dstBase + (i * stride), bytesPerMat, bytesPerMat);
+                    float* dst = (float*)resultMat.Data.ToPointer();
+                    for (int b = 0; b < currentBatch; b++)
+                    {
+                        dst[b] = outTensor.GetValue(b);
+                    }
                 }
             }
 
-            // 2. Run
-            _timer.Restart();
-            _session.RunWithBinding(_runOptions, _binding);
-            _timer.Stop();
-            double duration = _timer.Elapsed.TotalMilliseconds;
-
-            // 3. Copy Result to Cached Mat
-            unsafe
-            {
-                float* resultPtr = (float*)_cachedOutputMat.Data.ToPointer();
-                Marshal.Copy(_outputBuffer, 0, (IntPtr)resultPtr, batchSize);
-            }
-
-            // Return struct (Stack allocation only)
-            return (_cachedOutputMat, duration);
+            return (resultMat, _timer.Elapsed.TotalMilliseconds);
         }
 
-        // Optimized Single-Input Path
+        // ==============================================================================
+        // OVERLOADS
+        // ==============================================================================
+
         public IObservable<PredictionResult> Process(IObservable<Mat> source)
         {
             return Observable.Using(
                 () => this,
                 resource => source.Select(m =>
                 {
-                    // Reuse the list wrapper to avoid allocating "new[] { m }"
-                    resource._singleInputBatch.Clear();
-                    resource._singleInputBatch.Add(m);
-                    return resource.RunInference(resource._singleInputBatch);
+                    resource._inputBatch.Clear();
+                    resource._inputBatch.Add(m);
+                    return resource.RunInference(resource._inputBatch);
+                })
+            );
+        }
+
+        public IObservable<PredictionResult> Process(IObservable<Tuple<Mat, Mat>> source)
+        {
+            return Observable.Using(
+                () => this,
+                resource => source.Select(t =>
+                {
+                    resource._inputBatch.Clear();
+                    resource._inputBatch.Add(t.Item1);
+                    resource._inputBatch.Add(t.Item2);
+                    return resource.RunInference(resource._inputBatch);
                 })
             );
         }
@@ -251,19 +279,10 @@ namespace DeepBrainInterface
 
         public void Dispose()
         {
-            _inputOrtValue?.Dispose();
-            _outputOrtValue?.Dispose();
-
-            if (_inputPin.IsAllocated) _inputPin.Free();
-            if (_outputPin.IsAllocated) _outputPin.Free();
-
-            _binding?.Dispose();
+            if (_bufferPin.IsAllocated) _bufferPin.Free();
             _session?.Dispose();
-            _runOptions?.Dispose();
             _session = null;
-
-            _cachedOutputMat = null;
-            _singleInputBatch.Clear();
+            _inputBatch.Clear();
         }
     }
 }

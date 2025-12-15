@@ -1,12 +1,9 @@
 ﻿using Bonsai;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCV.Net;
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
-using System.Drawing.Design; // Required for UITypeEditor
+using System.Drawing.Design;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
@@ -17,7 +14,7 @@ namespace DeepBrainInterface
     [Combinator]
     [Description("CPU Inference: Single-Threaded. Merges inputs. Strict BatchSize check.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorRealTime
+    public class RippleDetectorRealTime : IDisposable // <--- CRITICAL FIX: Must implement interface
     {
         // ==============================================================================
         // 1. CONFIGURATION
@@ -86,6 +83,10 @@ namespace DeepBrainInterface
             {
                 throw new Exception($"Failed to load model at {ModelPath}. {ex.Message}");
             }
+            finally
+            {
+                opts.Dispose();
+            }
 
             // 3. Pre-Calculate Strides
             _inputStrideFloats = TimePoints * Channels;
@@ -96,20 +97,17 @@ namespace DeepBrainInterface
             float[] inBuffer = new float[BatchSize * _inputStrideFloats];
             _hInput = GCHandle.Alloc(inBuffer, GCHandleType.Pinned);
 
-            // 5. Determine Output Shape (Fixing int[] -> long[] conversion)
+            // 5. Determine Output Shape
             var outMeta = _session.OutputMetadata.First();
             int[] dimInts = outMeta.Value.Dimensions;
 
             long[] outShape = new long[dimInts.Length];
-            for (int i = 0; i < dimInts.Length; i++)
-            {
-                outShape[i] = (long)dimInts[i];
-            }
+            for (int i = 0; i < dimInts.Length; i++) outShape[i] = (long)dimInts[i];
 
             // Fix dynamic batch dimension if present
             if (outShape[0] <= 0) outShape[0] = (long)BatchSize;
 
-            // Get number of columns (e.g. 1 for prob only, 2 for prob+artifact)
+            // Get number of columns
             _outputCols = (int)outShape[outShape.Length - 1];
 
             long totalOutputFloats = 1;
@@ -154,9 +152,26 @@ namespace DeepBrainInterface
                 {
                     Mat m = inputs[i];
                     float* src = (float*)m.Data.ToPointer();
+                    float* dst = dstBase + (i * _inputStrideFloats);
 
-                    // Direct Memory Copy
-                    Buffer.MemoryCopy(src, dstBase + (i * _inputStrideFloats), _inputStrideBytes, _inputStrideBytes);
+                    // --- CHECK TRANSPOSE (Robustness) ---
+                    // If input is [Channels x Time] instead of [Time x Channels], transpose it on the fly.
+                    if (m.Rows == Channels && m.Cols == TimePoints)
+                    {
+                        // Transpose Copy: src[c, t] -> dst[t, c]
+                        for (int c = 0; c < Channels; c++)
+                        {
+                            for (int t = 0; t < TimePoints; t++)
+                            {
+                                dst[(t * Channels) + c] = src[(c * TimePoints) + t];
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Direct Memory Copy (Standard Case)
+                        Buffer.MemoryCopy(src, dst, _inputStrideBytes, _inputStrideBytes);
+                    }
                 }
             }
 
@@ -206,7 +221,7 @@ namespace DeepBrainInterface
             if (_hOutput.IsAllocated) _hOutput.Free();
             _binding?.Dispose();
             _session?.Dispose();
+            _session = null;
         }
     }
 }
-
