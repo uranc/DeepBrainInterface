@@ -21,9 +21,9 @@ namespace DeepBrainInterface
     {
         // Essential Logic Outputs
         public RippleState State { get; set; }
-        public bool TTL { get; set; }          // High during Hold (Hardware Trigger)
+        public bool TTL { get; set; }          // High during Hold (Hardware Trigger)  
 
-        // Accumulator Stats
+        // Accumulator Stats test timing
         public float Score { get; set; }       // Continuous Score
         public int EventCount { get; set; }    // Total detected events
 
