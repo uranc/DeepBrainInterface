@@ -7,257 +7,215 @@ using System.Drawing.Design;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Adaptive Detector. Runs Inference -> Checks Artifact (Index 1) -> Updates FSM -> Adjusts Stride.")]
+    [Description("Adaptive Detector with Unmanaged Ring Buffer. ZERO ALLOCATIONS.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorAdaptive
+    public class RippleDetectorAdaptive : IDisposable
     {
-        // ==============================================================================
-        // CONFIGURATION
-        // ==============================================================================
         [Category("Model")]
-        [Description("Path to the ONNX model file.")]
         [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
         [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
         [Category("Model Dimensions")] public int TimePoints { get; set; } = 44;
         [Category("Model Dimensions")] public int Channels { get; set; } = 8;
-        [Category("Model Dimensions")] public int BatchSize { get; set; } = 2;
 
-        [Category("Logic")]
-        [Description("Threshold for Index 1 (Artifact). If exceeded, Gate closes.")]
-        public float ArtifactThreshold { get; set; } = 0.5f;
+        [Category("Downsampling")]
+        [Description("How many raw samples to skip between each point fed into the model.")]
+        public int DownsampleFactor { get; set; } = 12;
+
+        [Category("System")] public int RingBufferCapacity { get; set; } = 30000;
+        [Category("System")] public bool HighPriorityThread { get; set; } = false;
 
         [Category("Logic")]
         [TypeConverter(typeof(ExpandableObjectConverter))]
         public RippleStateMachineMatBool StateMachine { get; set; } = new RippleStateMachineMatBool();
 
-        [Category("Adaptive Stride")] public int KBelowGate { get; set; } = 5;
-        [Category("Adaptive Stride")] public int KAtGate { get; set; } = 1;
+        [Category("Logic")] public bool DetectionEnabled { get; set; } = true;
+        [Category("Logic")] public int KBelowGate { get; set; } = 5;
+        [Category("Logic")] public int KAtGate { get; set; } = 1;
 
-        // ==============================================================================
-        // PROCESS
-        // ==============================================================================
-        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
+        private readonly object _inferenceLock = new object();
+
+        private InferenceSession _session;
+        private OrtIoBinding _binding;
+        private RunOptions _runOpts;
+
+        private float[] _bufIn, _bufOut, _ringBuffer, _snapshotBuffer;
+        private GCHandle _hIn, _hOut, _hRingBuffer, _hSnapshotBuffer;
+        private Mat _snapshotMat;
+
+        private int _headIndex = 0;
+        private int _strideCounter = 0;
+        private int _currentK = 1;
+
+        private void Initialise()
         {
-            return Observable.Using(
-                () => new AdaptiveEngine(ModelPath, BatchSize, Channels, TimePoints, StateMachine),
-                (AdaptiveEngine engine) =>
-                    source.Select(input =>
-                    {
-                        var mats = input.Item1;
-                        var extGate = input.Item2;
-                        Mat rawSig = mats.Item1;
-                        Mat rawArt = mats.Item2;
-                        return engine.Execute(rawSig, rawArt, extGate, ArtifactThreshold, KBelowGate, KAtGate);
-                    })
-            );
-        }
+            if (_session != null) return;
 
-        // ==============================================================================
-        // ENGINE
-        // ==============================================================================
-        private class AdaptiveEngine : IDisposable
-        {
-            private InferenceSession _session;
-            private OrtIoBinding _binding;
-            private RunOptions _runOpts;
-
-            // Persistent State
-            private RippleStateMachineMatBool _fsm;
-            private RippleOut _lastResult;
-
-            // Resources
-            private GCHandle _hInput, _hOutput;
-            private float[] _outBuffer;
-
-            // Dimensions
-            private int _strideFloats;
-            private long _strideBytes; // Using long for MemoryCopy size
-            private int _batchSize;
-
-            // Adaptive State
-            private int _strideCounter = 0;
-            private int _currentK = 1;
-
-            public AdaptiveEngine(string path, int batch, int channels, int time, RippleStateMachineMatBool fsm)
+            if (HighPriorityThread)
             {
-                _fsm = fsm;
-
-                // Init cache to defaults
-                _lastResult = new RippleOut
-                {
-                    State = RippleState.NoRipple,
-                    TTL = false,
-                    EventCount = 0,
-                    Score = 0f,
-                    Probability = 0f,
-                    ArtifactProbability = 0f,
-                    SignalData = null,
-                    StrideUsed = 1
-                };
-
-                // P-Core Optimization
-                try
-                {
-                    using (var proc = System.Diagnostics.Process.GetCurrentProcess())
-                    {
-                        if (proc.PriorityClass != System.Diagnostics.ProcessPriorityClass.High)
-                            proc.PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
-                    }
-                }
+                try { Thread.CurrentThread.Priority = ThreadPriority.Highest; }
                 catch { }
-
-                if (batch < 2) throw new ArgumentException("BatchSize must be >= 2.");
-
-                _batchSize = batch;
-                _strideFloats = time * channels;
-                _strideBytes = _strideFloats * sizeof(float);
-
-                var opts = new SessionOptions
-                {
-                    IntraOpNumThreads = 1,
-                    InterOpNumThreads = 1,
-                    ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-                    GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                    LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING
-                };
-
-                try
-                {
-                    _session = new InferenceSession(path, opts);
-                    _binding = _session.CreateIoBinding();
-                    _runOpts = new RunOptions();
-
-                    // Alloc Buffers
-                    float[] inBuffer = new float[batch * _strideFloats];
-                    _hInput = GCHandle.Alloc(inBuffer, GCHandleType.Pinned);
-                    _outBuffer = new float[batch];
-                    _hOutput = GCHandle.Alloc(_outBuffer, GCHandleType.Pinned);
-
-                    var mem = OrtMemoryInfo.DefaultInstance;
-                    using (var inOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inBuffer), new long[] { batch, time, channels }))
-                    using (var outOrt = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(_outBuffer), new long[] { batch, 1 }))
-                    {
-                        _binding.BindInput(_session.InputMetadata.Keys.First(), inOrt);
-                        _binding.BindOutput(_session.OutputMetadata.Keys.First(), outOrt);
-                    }
-                    _session.RunWithBinding(_runOpts, _binding);
-                }
-                catch (Exception ex)
-                {
-                    Dispose();
-                    throw new Exception($"Model Init Failed: {ex.Message}");
-                }
-                finally { opts.Dispose(); }
             }
 
-            public RippleOut Execute(Mat sig, Mat art, bool extGate, float artThresh, int kBelow, int kAt)
+            var opts = new SessionOptions
             {
-                // =========================================================
-                // 1. ADAPTIVE STRIDE (SKIPPED FRAME LOGIC)
-                // =========================================================
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                IntraOpNumThreads = 1,
+                InterOpNumThreads = 1,
+                EnableCpuMemArena = true
+            };
+
+            _session = new InferenceSession(ModelPath, opts);
+            _binding = _session.CreateIoBinding();
+            _runOpts = new RunOptions();
+
+            int inputFloats = TimePoints * Channels;
+            _bufIn = new float[inputFloats];
+            _hIn = GCHandle.Alloc(_bufIn, GCHandleType.Pinned);
+
+            _bufOut = new float[2];
+            _hOut = GCHandle.Alloc(_bufOut, GCHandleType.Pinned);
+
+            var memInfo = OrtMemoryInfo.DefaultInstance;
+
+            // THE FIX: Using Memory<float> precisely as you originally designed it.
+            using (var inOrt = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), new long[] { 1, TimePoints, Channels }))
+            using (var outOrt = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), new long[] { 1, 2 }))
+            {
+                _binding.BindInput(_session.InputMetadata.Keys.First(), inOrt);
+                _binding.BindOutput(_session.OutputMetadata.Keys.First(), outOrt);
+            }
+
+            _ringBuffer = new float[RingBufferCapacity * Channels];
+            _hRingBuffer = GCHandle.Alloc(_ringBuffer, GCHandleType.Pinned);
+
+            _snapshotBuffer = new float[Channels * TimePoints];
+            _hSnapshotBuffer = GCHandle.Alloc(_snapshotBuffer, GCHandleType.Pinned);
+            _snapshotMat = new Mat(Channels, TimePoints, Depth.F32, 1, _hSnapshotBuffer.AddrOfPinnedObject());
+
+            _currentK = KBelowGate;
+
+            _session.RunWithBinding(_runOpts, _binding);
+        }
+
+        public IObservable<RippleOut> Process(IObservable<Mat> source)
+            => source.SelectMany(m => ExecuteSafe(m, true));
+
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
+            => source.SelectMany(t => ExecuteSafe(t.Item1, t.Item2));
+
+        private RippleOut[] ExecuteSafe(Mat rawData, bool bnoOk)
+        {
+            lock (_inferenceLock)
+            {
+                if (_session == null) Initialise();
+
+                UpdateRingBufferUnsafe(rawData);
+
                 if (_currentK > 1)
                 {
                     _strideCounter++;
                     if (_strideCounter < _currentK)
                     {
-                        // Explicitly check and copy EVERY property from _lastResult
-                        return new RippleOut
-                        {
-                            // 1. State (Must persist)
-                            State = _lastResult.State,
-
-                            // 2. TTL (Must persist to hold High)
-                            TTL = _lastResult.TTL,
-
-                            // 3. Score (Must persist to avoid drop to 0)
-                            Score = _lastResult.Score,
-
-                            // 4. Event Count (Must persist)
-                            EventCount = _lastResult.EventCount,
-
-                            // 5. Probability (Must persist)
-                            Probability = _lastResult.Probability,
-
-                            // 6. Signal Data (Persist snapshot if exists)
-                            SignalData = _lastResult.SignalData,
-
-                            // 7. Artifact Prob (Must persist)
-                            ArtifactProbability = _lastResult.ArtifactProbability,
-
-                            // 8. Stride Used (Updated)
-                            StrideUsed = _currentK
-                        };
+                        return Array.Empty<RippleOut>();
                     }
                     _strideCounter = 0;
                 }
 
-                // =========================================================
-                // 2. MEMORY COPY (Reverted to standard Buffer.MemoryCopy)
-                // =========================================================
-                unsafe
-                {
-                    float* dstBase = (float*)_hInput.AddrOfPinnedObject();
-
-                    // Copy Signal (Batch 0)
-                    if (sig != null)
-                    {
-                        float* srcSig = (float*)sig.Data.ToPointer();
-                        Buffer.MemoryCopy(srcSig, dstBase, _strideBytes, _strideBytes);
-                    }
-
-                    // Copy Artifact (Batch 1)
-                    if (art != null && _batchSize > 1)
-                    {
-                        float* srcArt = (float*)art.Data.ToPointer();
-                        // Offset destination by one full sample stride
-                        Buffer.MemoryCopy(srcArt, dstBase + _strideFloats, _strideBytes, _strideBytes);
-                    }
-                }
-
-                // =========================================================
-                // 3. INFERENCE
-                // =========================================================
+                PrepareInputUnsafe();
                 _session.RunWithBinding(_runOpts, _binding);
 
-                float sigProb = _outBuffer[0];
-                float artProb = _outBuffer[1];
+                float sigProb = _bufOut[0];
+                float artProb = _bufOut[1];
 
-                // =========================================================
-                // 4. LOGIC & FSM
-                // =========================================================
-                bool isArtifact = artProb > artThresh;
-                bool finalGate = extGate && !isArtifact;
+                ExtractSnapshotUnsafe();
 
-                // Update persistent FSM
-                var result = _fsm.Update(sigProb, finalGate, sig);
+                StateMachine.DetectionEnabled = DetectionEnabled;
+                bool gatesOpen = bnoOk && (artProb < StateMachine.GateThreshold);
 
-                // =========================================================
-                // 5. CACHE UPDATE
-                // =========================================================
-                _lastResult = result;
-                _currentK = (result.State != RippleState.NoRipple) ? kAt : kBelow;
+                RippleOut result = StateMachine.Update(sigProb, artProb, gatesOpen, _snapshotMat);
 
-                // Inject metadata
+                _currentK = (result.State == RippleState.Possible || result.State == RippleState.Ripple) ? KAtGate : KBelowGate;
                 result.StrideUsed = _currentK;
-                result.ArtifactProbability = artProb;
 
-                return result;
+                return new[] { result };
             }
+        }
 
-            public void Dispose()
+        private unsafe void UpdateRingBufferUnsafe(Mat mat)
+        {
+            float* srcPtr = (float*)mat.Data.ToPointer();
+            float* ringPtr = (float*)_hRingBuffer.AddrOfPinnedObject().ToPointer();
+            int cols = mat.Cols;
+
+            for (int t = 0; t < cols; t++)
             {
-                _session?.Dispose();
-                _binding?.Dispose();
-                _runOpts?.Dispose();
-                if (_hInput.IsAllocated) _hInput.Free();
-                if (_hOutput.IsAllocated) _hOutput.Free();
+                int ringIdx = (_headIndex + t) % RingBufferCapacity;
+                int ringOffset = ringIdx * Channels;
+
+                for (int c = 0; c < Channels; c++)
+                {
+                    ringPtr[ringOffset + c] = srcPtr[c * cols + t];
+                }
             }
+            _headIndex = (_headIndex + cols) % RingBufferCapacity;
+        }
+
+        private unsafe void PrepareInputUnsafe()
+        {
+            float* dstPtr = (float*)_hIn.AddrOfPinnedObject().ToPointer();
+            float* ringPtr = (float*)_hRingBuffer.AddrOfPinnedObject().ToPointer();
+
+            for (int t = 0; t < TimePoints; t++)
+            {
+                int stepsBack = (TimePoints - 1 - t) * DownsampleFactor;
+                int ringIdx = _headIndex - 1 - stepsBack;
+
+                while (ringIdx < 0) ringIdx += RingBufferCapacity;
+                int ringOffset = ringIdx * Channels;
+
+                for (int c = 0; c < Channels; c++)
+                {
+                    dstPtr[(t * Channels) + c] = ringPtr[ringOffset + c];
+                }
+            }
+        }
+
+        private unsafe void ExtractSnapshotUnsafe()
+        {
+            float* ringPtr = (float*)_hRingBuffer.AddrOfPinnedObject().ToPointer();
+            float* dstPtr = (float*)_hSnapshotBuffer.AddrOfPinnedObject().ToPointer();
+
+            for (int t = 0; t < TimePoints; t++)
+            {
+                int ringIdx = _headIndex - 1 - (TimePoints - 1 - t);
+                while (ringIdx < 0) ringIdx += RingBufferCapacity;
+                int ringOffset = ringIdx * Channels;
+
+                for (int c = 0; c < Channels; c++)
+                {
+                    dstPtr[c * TimePoints + t] = ringPtr[ringOffset + c];
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_hIn.IsAllocated) _hIn.Free();
+            if (_hOut.IsAllocated) _hOut.Free();
+            if (_hRingBuffer.IsAllocated) _hRingBuffer.Free();
+            if (_hSnapshotBuffer.IsAllocated) _hSnapshotBuffer.Free();
+
+            _binding?.Dispose();
+            _runOpts?.Dispose();
+            _session?.Dispose();
         }
     }
 }

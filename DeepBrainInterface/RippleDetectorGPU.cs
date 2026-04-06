@@ -48,7 +48,7 @@ namespace DeepBrainInterface
         public int InterOpNumThreads { get; set; } = 1;
 
         [Category("Optimizations")]
-        [Description("Forces execution on Cores 0-7 (P-Cores). Fixes latency on Intel 12th/13th/14th Gen Hybrid CPUs.")]
+        [Description("Forces execution on Cores 0-7 (P-Cores). Fixes latency on Intel Hybrid CPUs.")]
         public bool PinToPCores { get; set; } = false;
 
         [Category("Optimizations")]
@@ -65,6 +65,9 @@ namespace DeepBrainInterface
         [Category("Dimensions")]
         public int Channels { get; set; } = 8;
         /* ───────────────────────────────────────────────────────────────── */
+
+        // Thread Safety (CRITICAL for OpenEphys ONIX)
+        private readonly object _inferenceLock = new object();
 
         // Resources
         private InferenceSession _session;
@@ -96,16 +99,13 @@ namespace DeepBrainInterface
             {
                 using (var proc = System.Diagnostics.Process.GetCurrentProcess())
                 {
-                    // A. High Priority
                     if (proc.PriorityClass != System.Diagnostics.ProcessPriorityClass.High)
                         proc.PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
 
-                    // B. P-Core Pinning
                     if (PinToPCores)
                     {
                         long affinityMask = (long)proc.ProcessorAffinity;
-                        long pCoreMask = 0xFF;
-
+                        long pCoreMask = 0xFF; // Adjust based on your actual P-Core count if needed
                         if ((affinityMask & pCoreMask) == pCoreMask)
                         {
                             proc.ProcessorAffinity = (IntPtr)pCoreMask;
@@ -129,21 +129,13 @@ namespace DeepBrainInterface
                 EnableCpuMemArena = true
             };
 
-            // Critical Parity Settings
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
             opts.AddSessionConfigEntry("session.enable_mem_pattern", "1");
             opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
-            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested"); // Fixed typo 'options' -> 'opts'
+            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
 
-            // Latency Optimization (Spinning)
-            if (AllowSpinning)
-            {
-                opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "1");
-            }
-            else
-            {
-                opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
-            }
+            if (AllowSpinning) opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "1");
+            else opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
 
             // 4. Set Provider
             try
@@ -204,77 +196,77 @@ namespace DeepBrainInterface
 
         private PredictionResult RunInference(IList<Mat> mats)
         {
-            int currentBatch = mats.Count;
-            if (currentBatch == 0) return (null, 0);
-
-            InitializeSession(currentBatch);
-
-            var tensor = BuildTensor(mats);
-            var named = NamedOnnxValue.CreateFromTensor(_inputName, tensor);
-
-            _inputs.Clear();
-            _inputs.Add(named);
-
-            _timer.Restart();
-
-            // Output Allocation
-            var resultMat = new Mat(1, 1, Depth.F32, currentBatch);
-
-            using (var results = _session.Run(_inputs))
+            // CRITICAL: Lock prevents OpenEphys threads from colliding in unmanaged memory
+            lock (_inferenceLock)
             {
-                _timer.Stop();
-                var outTensor = results.First().AsTensor<float>();
+                int currentBatch = mats.Count;
+                if (currentBatch == 0) return (null, 0);
 
-                unsafe
+                InitializeSession(currentBatch);
+
+                var tensor = BuildTensor(mats);
+                var named = NamedOnnxValue.CreateFromTensor(_inputName, tensor);
+
+                _inputs.Clear();
+                _inputs.Add(named);
+
+                _timer.Restart();
+
+                var resultMat = new Mat(1, 1, Depth.F32, currentBatch);
+
+                using (var results = _session.Run(_inputs))
                 {
-                    float* dst = (float*)resultMat.Data.ToPointer();
-                    for (int b = 0; b < currentBatch; b++)
+                    _timer.Stop();
+                    var outTensor = results.First().AsTensor<float>();
+
+                    unsafe
                     {
-                        dst[b] = outTensor.GetValue(b);
+                        float* dst = (float*)resultMat.Data.ToPointer();
+                        for (int b = 0; b < currentBatch; b++)
+                        {
+                            dst[b] = outTensor.GetValue(b);
+                        }
                     }
                 }
-            }
 
-            return (resultMat, _timer.Elapsed.TotalMilliseconds);
+                return (resultMat, _timer.Elapsed.TotalMilliseconds);
+            }
         }
 
         // ==============================================================================
-        // OVERLOADS
+        // OVERLOADS (Now Thread-Safe and memory-leak free)
         // ==============================================================================
 
         public IObservable<PredictionResult> Process(IObservable<Mat> source)
         {
-            return Observable.Using(
-                () => this,
-                resource => source.Select(m =>
+            return source.Select(m =>
+            {
+                lock (_inferenceLock)
                 {
-                    resource._inputBatch.Clear();
-                    resource._inputBatch.Add(m);
-                    return resource.RunInference(resource._inputBatch);
-                })
-            );
+                    _inputBatch.Clear();
+                    _inputBatch.Add(m);
+                    return RunInference(_inputBatch);
+                }
+            });
         }
 
         public IObservable<PredictionResult> Process(IObservable<Tuple<Mat, Mat>> source)
         {
-            return Observable.Using(
-                () => this,
-                resource => source.Select(t =>
+            return source.Select(t =>
+            {
+                lock (_inferenceLock)
                 {
-                    resource._inputBatch.Clear();
-                    resource._inputBatch.Add(t.Item1);
-                    resource._inputBatch.Add(t.Item2);
-                    return resource.RunInference(resource._inputBatch);
-                })
-            );
+                    _inputBatch.Clear();
+                    _inputBatch.Add(t.Item1);
+                    _inputBatch.Add(t.Item2);
+                    return RunInference(_inputBatch);
+                }
+            });
         }
 
         public IObservable<PredictionResult> Process(IObservable<IList<Mat>> source)
         {
-            return Observable.Using(
-               () => this,
-               resource => source.Select(batch => resource.RunInference(batch))
-           );
+            return source.Select(batch => RunInference(batch));
         }
 
         public void Dispose()
