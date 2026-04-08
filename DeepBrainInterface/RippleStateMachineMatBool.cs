@@ -7,14 +7,8 @@ using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {
-    public enum RippleState
-    {
-        NoRipple,
-        Possible,
-        Ripple
-    }
+    public enum RippleState { NoRipple, Possible, Ripple }
 
-    // struct (Value Type) prevents GC allocations on skipped frames
     public struct RippleOut
     {
         public RippleState State { get; set; }
@@ -39,7 +33,6 @@ namespace DeepBrainInterface
         [Category("Thresholds")] public float EventScoreThreshold { get; set; } = 2.5f;
         [Category("Thresholds")] public int GraceSamples { get; set; } = 5;
         [Category("Thresholds")] public float GraceRate { get; set; } = 1.0f;
-
         [Category("TTL Output")] public int TriggerDelayMs { get; set; } = 0;
         [Category("TTL Output")] public bool RandomizeDelay { get; set; } = false;
         [Category("TTL Output")] public int PostRippleMs { get; set; } = 50;
@@ -183,6 +176,29 @@ namespace DeepBrainInterface
                 SignalData = data,
                 StrideUsed = 0
             };
+        }
+
+        private float GetVal(Mat m)
+        {
+            if (m == null) return 0f;
+            unsafe { return *((float*)m.Data.ToPointer()); }
+        }
+
+        public IObservable<RippleOut> Process(IObservable<Mat> source)
+            => source.Select(m => Update(GetVal(m), 0f, true, null));
+
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
+            => source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null));
+
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
+        {
+            return source.Select(t =>
+            {
+                float prob = GetVal(t.Item1.Item1);
+                Mat rawData = t.Item1.Item2;
+                bool gate = t.Item2;
+                return Update(prob, 0f, gate, rawData);
+            });
         }
     }
 }

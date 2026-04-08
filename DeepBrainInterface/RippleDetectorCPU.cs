@@ -12,12 +12,9 @@ using System.Runtime.InteropServices;
 
 namespace DeepBrainInterface
 {
-    public enum OnnxProvider { Cpu, Cuda, TensorRT }
-
-    [Combinator]
-    [Description("Hyper-Optimized GPU Inference. Zero-Allocation, Red-Lined, and Shape-Safeguarded.")]
+    [Description("Ultimate Zero-Allocation CPU Fast-Path. Hardware-locked, red-lined, and shape-safeguarded.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorGPU : IDisposable
+    public class RippleDetectorCPU : Transform<Mat, Tuple<Mat, double>>, IDisposable
     {
         /* ───── Windows Kernel P/Invoke Hooks ───── */
         [DllImport("kernel32.dll")]
@@ -38,25 +35,20 @@ namespace DeepBrainInterface
         [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
-        [Category("2. Settings")] public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
-        [Category("2. Settings")] public int DeviceId { get; set; } = 0;
-        [Category("2. Settings")] public int IntraOpNumThreads { get; set; } = 1;
-        [Category("2. Settings")] public int InterOpNumThreads { get; set; } = 1;
+        [Category("2. Dimensions (Must Match Input)")]
+        public int BatchSize { get; set; } = 1;
+        [Category("2. Dimensions (Must Match Input)")]
+        public int TimePoints { get; set; } = 44;
+        [Category("2. Dimensions (Must Match Input)")]
+        public int Channels { get; set; } = 8;
 
-        [Category("3. Dimensions (Must Match Input)")] public int BatchSize { get; set; } = 1;
-        [Category("3. Dimensions (Must Match Input)")] public int TimePoints { get; set; } = 44;
-        [Category("3. Dimensions (Must Match Input)")] public int Channels { get; set; } = 8;
-
-        [Category("4. Hardware & Red-Lining")]
-        [Description("The logical CPU core to lock the ONNX orchestrator thread to (e.g., 2).")]
+        [Category("3. Hardware & Red-Lining")]
+        [Description("The logical CPU core to lock the ONNX thread to. (e.g. 2 means Core 2). Keeps Windows OS scheduler away.")]
         public int CpuCoreAffinity { get; set; } = 2;
 
-        [Category("4. Hardware & Red-Lining")]
-        [Description("Runs the math EVERY frame to keep the PCIe bus awake, but only outputs a valid result every Nth frame.")]
+        [Category("3. Hardware & Red-Lining")]
+        [Description("Runs the math EVERY frame to keep the CPU awake, but only outputs a valid result every Nth frame.")]
         public int RunInterval { get; set; } = 3;
-
-        [Category("4. Hardware & Red-Lining")]
-        public bool AllowSpinning { get; set; } = true;
 
         /* ───── State & Buffers ───── */
         private readonly object _inferenceLock = new object();
@@ -64,14 +56,17 @@ namespace DeepBrainInterface
         private int _batchCounter = 0;
 
         private InferenceSession _session;
-        private OrtIoBinding _binding;
         private RunOptions _runOpts;
         private Stopwatch _timer = new Stopwatch();
 
         private float[] _bufIn, _bufOut;
         private GCHandle _hIn, _hOut;
         private Mat _resultMat;
-        private OrtValue _valIn, _valOut;
+
+        private OrtValue[] _inputValues;
+        private OrtValue[] _outputValues;
+        private string[] _inputNames;
+        private string[] _outputNames;
 
         private int _inputStride;
         private readonly List<Mat> _inputCache = new List<Mat>(2);
@@ -84,11 +79,14 @@ namespace DeepBrainInterface
             // 1. Hardware Subnormal Float Flush 
             try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
 
-            // 2. Process Escalation (Fully Qualified to avoid CS0119 collision)
+            // 2. Process Escalation
             try
             {
+                // Fully qualify System.Diagnostics to avoid colliding with your Process() method
                 using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                {
                     process.PriorityClass = ProcessPriorityClass.RealTime;
+                }
                 System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
             }
             catch { }
@@ -96,38 +94,24 @@ namespace DeepBrainInterface
             // 3. Ultra-Lean ORT Config
             var opts = new SessionOptions
             {
-                IntraOpNumThreads = IntraOpNumThreads,
-                InterOpNumThreads = InterOpNumThreads,
+                IntraOpNumThreads = 1,
+                InterOpNumThreads = 1,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 EnableCpuMemArena = true,
                 EnableMemoryPattern = true
             };
 
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
-            opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
             opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
-            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", AllowSpinning ? "1" : "0");
-
-            try
-            {
-                if (Provider == OnnxProvider.TensorRT)
-                {
-                    Environment.SetEnvironmentVariable("ORT_TENSORRT_FP16_ENABLE", "1");
-                    opts.AppendExecutionProvider_Tensorrt(DeviceId);
-                    opts.AppendExecutionProvider_CUDA(DeviceId);
-                }
-                else if (Provider == OnnxProvider.Cuda)
-                {
-                    opts.AppendExecutionProvider_CUDA(DeviceId);
-                }
-            }
-            catch { Provider = OnnxProvider.Cpu; }
+            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "1");
 
             _session = new InferenceSession(ModelPath, opts);
-            _binding = _session.CreateIoBinding();
             _runOpts = new RunOptions();
             opts.Dispose();
+
+            _inputNames = new string[] { _session.InputMetadata.Keys.First() };
+            _outputNames = new string[] { _session.OutputMetadata.Keys.First() };
 
             long[] inShape = new long[] { BatchSize, TimePoints, Channels };
             int inSize = BatchSize * TimePoints * Channels;
@@ -151,21 +135,16 @@ namespace DeepBrainInterface
             _hOut = GCHandle.Alloc(_bufOut, GCHandleType.Pinned);
 
             var memInfo = OrtMemoryInfo.DefaultInstance;
-
-            _valIn = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), inShape);
-            _valOut = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), outShape);
-
-            // Bind explicitly to GPU I/O bindings to prevent PCIe copy overhead during Inference
-            _binding.BindInput(_session.InputMetadata.Keys.First(), _valIn);
-            _binding.BindOutput(_session.OutputMetadata.Keys.First(), _valOut);
+            _inputValues = new OrtValue[] { OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), inShape) };
+            _outputValues = new OrtValue[] { OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), outShape) };
 
             int cols = outSize / BatchSize;
             _resultMat = new Mat(BatchSize, cols, Depth.F32, 1, _hOut.AddrOfPinnedObject());
 
-            // 5. Deep Warmup: Crucial for TensorRT engine building and GPU VRAM allocation
-            for (int i = 0; i < 50; i++)
+            // 5. Deep Warmup: Run 100 times to violently stretch the Arena Allocator
+            for (int i = 0; i < 100; i++)
             {
-                _session.RunWithBinding(_runOpts, _binding);
+                _session.Run(_runOpts, _inputNames, _inputValues, _outputNames, _outputValues);
             }
         }
 
@@ -175,24 +154,20 @@ namespace DeepBrainInterface
             {
                 if (_session == null) InitializeSession();
 
-                // Lock Thread Affinity for the CPU Orchestrator
+                // Lock Thread Affinity
                 if (!_isThreadPinned)
                 {
                     SetThreadAffinityMask(GetCurrentThread(), new IntPtr(1 << CpuCoreAffinity));
                     _isThreadPinned = true;
                 }
 
-                if (mats.Count != BatchSize)
-                    throw new InvalidOperationException($"CRITICAL: Expected {BatchSize} Mats, but received {mats.Count}.");
-
                 unsafe
                 {
                     float* dstBase = (float*)_hIn.AddrOfPinnedObject().ToPointer();
                     int expectedElements = TimePoints * Channels;
 
-                    for (int i = 0; i < BatchSize; i++)
+                    for (int i = 0; i < mats.Count; i++)
                     {
-                        // THE GUARDRAIL: Prevents CLR 0xc0000005 crashes
                         int actualElements = mats[i].Rows * mats[i].Cols;
                         if (actualElements != expectedElements)
                         {
@@ -217,9 +192,9 @@ namespace DeepBrainInterface
                     }
                 }
 
-                // THE GHOST RUN: Keep the PCIe bus and GPU active
+                // THE GHOST RUN: Always execute the math
                 _timer.Restart();
-                _session.RunWithBinding(_runOpts, _binding);
+                _session.Run(_runOpts, _inputNames, _inputValues, _outputNames, _outputValues);
                 _timer.Stop();
 
                 _batchCounter++;
@@ -235,8 +210,8 @@ namespace DeepBrainInterface
             }
         }
 
-        // --- OVERLOADS ---
-        public IObservable<Tuple<Mat, double>> Process(IObservable<Mat> source)
+        // --- NATIVE BONSAI OVERRIDE ---
+        public override IObservable<Tuple<Mat, double>> Process(IObservable<Mat> source)
         {
             return source.Select(m =>
             {
@@ -246,26 +221,7 @@ namespace DeepBrainInterface
                     _inputCache.Add(m);
                     return RunInference(_inputCache);
                 }
-            }).Where(res => res != null); // Drop invalid Ghost Runs
-        }
-
-        public IObservable<Tuple<Mat, double>> Process(IObservable<Tuple<Mat, Mat>> source)
-        {
-            return source.Select(t =>
-            {
-                lock (_inferenceLock)
-                {
-                    _inputCache.Clear();
-                    _inputCache.Add(t.Item1);
-                    _inputCache.Add(t.Item2);
-                    return RunInference(_inputCache);
-                }
-            }).Where(res => res != null);
-        }
-
-        public IObservable<Tuple<Mat, double>> Process(IObservable<IList<Mat>> source)
-        {
-            return source.Select(batch => RunInference(batch)).Where(res => res != null);
+            }).Where(res => res != null); // Instantly drop invalid Ghost Runs
         }
 
         public void Dispose()
@@ -273,12 +229,11 @@ namespace DeepBrainInterface
             if (_hIn.IsAllocated) _hIn.Free();
             if (_hOut.IsAllocated) _hOut.Free();
 
-            _valIn?.Dispose();
-            _valOut?.Dispose();
-            _binding?.Dispose();
+            if (_inputValues != null) foreach (var v in _inputValues) v?.Dispose();
+            if (_outputValues != null) foreach (var v in _outputValues) v?.Dispose();
+
             _runOpts?.Dispose();
             _session?.Dispose();
-            _inputCache.Clear();
         }
     }
 }

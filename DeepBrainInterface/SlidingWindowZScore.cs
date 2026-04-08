@@ -18,18 +18,15 @@ namespace DeepBrainInterface
         [Description("Number of channels (rows) in each incoming Mat.")]
         public int Channels { get; set; } = 8;
 
-        // Zero-Allocation State
         private readonly object _lock = new object();
         private bool _initialized = false;
 
-        // 1D array for faster memory access
         private float[] _history;
         private double[] _sum;
         private double[] _sumSq;
         private int _writeIndex = 0;
         private int _samplesSeen = 0;
 
-        // Pinned Output
         private float[] _outBuffer;
         private GCHandle _hOutBuffer;
         private Mat _outMat;
@@ -74,18 +71,15 @@ namespace DeepBrainInterface
                             float newValue = src[i];
                             int historyOffset = (i * WindowSize) + _writeIndex;
 
-                            // 1. Remove old value
                             float oldValue = (_samplesSeen < WindowSize) ? 0f : _history[historyOffset];
                             _sum[i] -= oldValue;
                             _sumSq[i] -= (double)oldValue * oldValue;
 
-                            // 2. Add new value
                             _history[historyOffset] = newValue;
                             _sum[i] += newValue;
                             _sumSq[i] += (double)newValue * newValue;
 
-                            // 3. Compute Z-Score directly into pinned output buffer
-                            int n_t = Math.Max(1, count); // Prevent div by zero on frame 0
+                            int n_t = Math.Max(1, count);
                             double mu = _sum[i] / n_t;
                             double avgSq = _sumSq[i] / n_t;
                             double variance = Math.Max(0, avgSq - (mu * mu));
@@ -98,7 +92,6 @@ namespace DeepBrainInterface
                     _writeIndex = (_writeIndex + 1) % WindowSize;
                     _samplesSeen++;
 
-                    // Return the pre-allocated envelope
                     return _outMat;
                 }
             });
