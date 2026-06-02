@@ -22,24 +22,44 @@ namespace DeepBrainInterface
     }
 
     [Combinator]
-    [Description("Accumulator FSM. Inputs: Signal (Mat) + Master Gate (Bool).")]
+    [Description("Accumulator FSM. Thread-safe with Leaky Bucket Grace Period.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public sealed class RippleStateMachineMatBool
     {
         [Category("General")] public bool DetectionEnabled { get; set; } = true;
-        [Category("Thresholds")] public float GateThreshold { get; set; } = 0.10f;
-        [Category("Thresholds")] public float EnterThreshold { get; set; } = 0.50f;
-        [Category("Thresholds")] public float ConfirmThreshold { get; set; } = 0.80f;
-        [Category("Thresholds")] public float EventScoreThreshold { get; set; } = 2.5f;
-        [Category("Thresholds")] public int GraceSamples { get; set; } = 5;
-        [Category("Thresholds")] public float GraceRate { get; set; } = 1.0f;
-        [Category("TTL Output")] public int TriggerDelayMs { get; set; } = 0;
-        [Category("TTL Output")] public bool RandomizeDelay { get; set; } = false;
-        [Category("TTL Output")] public int PostRippleMs { get; set; } = 50;
+
+        [Category("1. Thresholds (0.0 to 1.0)")]
+        [Description("Threshold 1 (Floor): If probability drops below this, start the dip timer.")]
+        public float Threshold1_IgnoreBelow { get; set; } = 0.10f;
+
+        [Category("1. Thresholds (0.0 to 1.0)")]
+        [Description("Threshold 2 (Weak): Awards 1 evidence point per frame.")]
+        public float Threshold2_WeakEvidence { get; set; } = 0.50f;
+
+        [Category("1. Thresholds (0.0 to 1.0)")]
+        [Description("Threshold 3 (Strong): Awards 2 evidence points per frame.")]
+        public float Threshold3_StrongEvidence { get; set; } = 0.80f;
+
+        [Category("2. Scoring")]
+        [Description("Total points needed to trigger the hardware TTL.")]
+        public float TargetEvidenceScore { get; set; } = 5.0f;
+
+        [Category("3. Leaky Bucket (Anti-Flicker)")]
+        [Description("How many consecutive frames to WAIT during a dip BEFORE subtracting points.")]
+        public int FramesToWaitBeforeDecay { get; set; } = 5;
+
+        [Category("3. Leaky Bucket (Anti-Flicker)")]
+        [Description("How many points to subtract from the score per frame AFTER the wait period.")]
+        public float ScoreDecayPerFrame { get; set; } = 1.0f;
+
+        [Category("4. TTL Output")] public int TriggerDelayMs { get; set; } = 0;
+        [Category("4. TTL Output")] public bool RandomizeDelay { get; set; } = false;
+        [Category("4. TTL Output")] public int PostRippleMs { get; set; } = 50;
 
         RippleState _state = RippleState.NoRipple;
         float _scoreTicks;
         int _ticksInPossible;
+        int _ticksDipping;
         int _eventCount;
 
         bool _ttlArmed;
@@ -49,118 +69,156 @@ namespace DeepBrainInterface
 
         static readonly Stopwatch Clock = Stopwatch.StartNew();
         private readonly Random _random = new Random();
+        private readonly object _fsmLock = new object();
 
         public RippleOut Update(float signal, float artProb, bool gateOpen, Mat rawInput)
         {
-            long now = Clock.ElapsedMilliseconds;
-            Mat triggerSnapshot = null;
-            float reportingScore = _scoreTicks;
-
-            if (_ttlHolding)
+            lock (_fsmLock)
             {
-                if (now >= _ttlHoldUntilMs)
+                long now = Clock.ElapsedMilliseconds;
+                Mat triggerSnapshot = null;
+                float reportingScore = _scoreTicks;
+
+                // 1. Handle TTL Refractory Period
+                if (_ttlHolding)
                 {
-                    _ttlHolding = false;
+                    if (now >= _ttlHoldUntilMs)
+                    {
+                        _ttlHolding = false;
+                        _state = RippleState.NoRipple;
+                        _scoreTicks = 0;
+                        _ticksInPossible = 0;
+                        _ticksDipping = 0;
+                        reportingScore = 0f;
+                    }
+                    else return Pack(signal, artProb, 0f, true, null);
+                }
+
+                // 2. Handle Delayed TTL Trigger
+                if (_ttlArmed)
+                {
+                    if (now >= _ttlAtMs)
+                    {
+                        _ttlArmed = false;
+                        _ttlHolding = true;
+                        _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
+                        triggerSnapshot = rawInput?.Clone();
+                        return Pack(signal, artProb, 0f, true, triggerSnapshot);
+                    }
+                    return Pack(signal, artProb, reportingScore, false, null);
+                }
+
+                // 3. Master Gate Check
+                bool allowed = DetectionEnabled && gateOpen;
+                if (!allowed)
+                {
                     _state = RippleState.NoRipple;
                     _scoreTicks = 0;
                     _ticksInPossible = 0;
-                    reportingScore = 0;
+                    _ticksDipping = 0;
+                    return Pack(signal, artProb, 0f, false, null);
                 }
-                else return Pack(signal, artProb, 0f, true, null);
-            }
 
-            if (_ttlArmed)
-            {
-                if (now >= _ttlAtMs)
+                // 4. State Machine Logic
+                switch (_state)
                 {
-                    _ttlArmed = false;
-                    _ttlHolding = true;
-                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
-                    triggerSnapshot = rawInput?.Clone();
-                    return Pack(signal, artProb, 0f, true, triggerSnapshot);
-                }
-                return Pack(signal, artProb, reportingScore, false, null);
-            }
-
-            bool allowed = DetectionEnabled && gateOpen;
-            if (!allowed)
-            {
-                _state = RippleState.NoRipple;
-                _scoreTicks = 0;
-                _ticksInPossible = 0;
-                return Pack(signal, artProb, 0f, false, null);
-            }
-
-            float scoreTarget = EventScoreThreshold * 2.0f;
-
-            switch (_state)
-            {
-                case RippleState.NoRipple:
-                    if (signal >= GateThreshold)
-                    {
-                        _state = RippleState.Possible;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
-                    }
-                    reportingScore = 0f;
-                    break;
-
-                case RippleState.Possible:
-                    _ticksInPossible++;
-                    if (signal >= ConfirmThreshold) _scoreTicks += 2.0f;
-                    else if (signal >= EnterThreshold) _scoreTicks += 1.0f;
-
-                    reportingScore = _scoreTicks;
-
-                    if (_scoreTicks >= scoreTarget)
-                    {
-                        _state = RippleState.Ripple;
-                        _eventCount++;
-                        float peakScore = _scoreTicks;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
-
-                        if (TriggerDelayMs > 0)
+                    case RippleState.NoRipple:
+                        if (signal >= Threshold1_IgnoreBelow)
                         {
-                            _ttlArmed = true;
-                            int actualDelay = RandomizeDelay ? _random.Next(0, TriggerDelayMs + 1) : TriggerDelayMs;
-                            _ttlAtMs = now + actualDelay;
-                            return Pack(signal, artProb, peakScore, false, null);
+                            _state = RippleState.Possible;
+                            _scoreTicks = 0;
+                            _ticksInPossible = 0;
+                            _ticksDipping = 0;
+                        }
+                        reportingScore = 0f;
+                        break;
+
+                    case RippleState.Possible:
+
+                        if (signal >= Threshold1_IgnoreBelow)
+                        {
+                            // We are above the floor. Reset the dip timer and count frames.
+                            _ticksDipping = 0;
+                            _ticksInPossible++;
+
+                            // Accumulate Evidence
+                            if (signal >= Threshold3_StrongEvidence) _scoreTicks += 2.0f;
+                            else if (signal >= Threshold2_WeakEvidence) _scoreTicks += 1.0f;
+
+                            reportingScore = _scoreTicks;
+
+                            // Check Trigger Condition
+                            if (_scoreTicks >= TargetEvidenceScore)
+                            {
+                                _state = RippleState.Ripple;
+                                _eventCount++;
+                                float peakScore = _scoreTicks;
+                                _scoreTicks = 0;
+                                _ticksInPossible = 0;
+                                _ticksDipping = 0;
+
+                                if (TriggerDelayMs > 0)
+                                {
+                                    _ttlArmed = true;
+                                    int actualDelay = RandomizeDelay ? _random.Next(0, TriggerDelayMs + 1) : TriggerDelayMs;
+                                    _ttlAtMs = now + actualDelay;
+                                    return Pack(signal, artProb, peakScore, false, null);
+                                }
+                                else
+                                {
+                                    _ttlHolding = true;
+                                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
+                                    triggerSnapshot = rawInput?.Clone();
+                                    return Pack(signal, artProb, peakScore, true, triggerSnapshot);
+                                }
+                            }
                         }
                         else
                         {
-                            _ttlHolding = true;
-                            _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
-                            triggerSnapshot = rawInput?.Clone();
-                            return Pack(signal, artProb, peakScore, true, triggerSnapshot);
+                            // The signal dipped below the floor. Start the leaky bucket logic.
+                            _ticksDipping++;
+
+                            if (_ticksDipping > FramesToWaitBeforeDecay)
+                            {
+                                // We held our breath too long. Start bleeding points.
+                                _scoreTicks -= ScoreDecayPerFrame;
+
+                                if (_scoreTicks <= 0)
+                                {
+                                    // The bucket is empty. Hard reset.
+                                    _state = RippleState.NoRipple;
+                                    _scoreTicks = 0;
+                                    _ticksInPossible = 0;
+                                    _ticksDipping = 0;
+                                    reportingScore = 0f;
+                                }
+                                else
+                                {
+                                    reportingScore = _scoreTicks;
+                                }
+                            }
+                            else
+                            {
+                                // We are inside the grace period. Hold the score steady.
+                                reportingScore = _scoreTicks;
+                            }
                         }
-                    }
-                    else if (signal < GateThreshold)
-                    {
-                        _state = RippleState.NoRipple;
-                        _scoreTicks = 0;
-                        _ticksInPossible = 0;
-                        reportingScore = 0f;
-                    }
-                    else if (_ticksInPossible > GraceSamples)
-                    {
-                        _scoreTicks -= GraceRate;
-                        if (_scoreTicks < 0) _scoreTicks = 0;
-                        reportingScore = _scoreTicks;
-                    }
-                    break;
+                        break;
 
-                case RippleState.Ripple:
-                    if (signal < GateThreshold)
-                    {
-                        _state = RippleState.NoRipple;
-                        _scoreTicks = 0;
-                        reportingScore = 0f;
-                    }
-                    break;
+                    case RippleState.Ripple:
+                        // After a successful trigger, wait until the event completely finishes
+                        if (signal < Threshold1_IgnoreBelow)
+                        {
+                            _state = RippleState.NoRipple;
+                            _scoreTicks = 0;
+                            _ticksDipping = 0;
+                            reportingScore = 0f;
+                        }
+                        break;
+                }
+
+                return Pack(signal, artProb, reportingScore, _ttlHolding, triggerSnapshot);
             }
-
-            return Pack(signal, artProb, reportingScore, _ttlHolding, triggerSnapshot);
         }
 
         private RippleOut Pack(float signal, float artProb, float currentScore, bool ttl, Mat data)
@@ -168,7 +226,7 @@ namespace DeepBrainInterface
             return new RippleOut
             {
                 State = _state,
-                Score = currentScore * 0.5f,
+                Score = currentScore,
                 Probability = signal,
                 ArtifactProbability = artProb,
                 EventCount = _eventCount,

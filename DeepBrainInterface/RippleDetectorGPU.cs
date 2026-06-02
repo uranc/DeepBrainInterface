@@ -4,281 +4,153 @@ using OpenCV.Net;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Drawing.Design;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 
 namespace DeepBrainInterface
 {
-    public enum OnnxProvider { Cpu, Cuda, TensorRT }
+    public struct InferenceResult
+    {
+        public bool IsValid { get; set; }
+        public Mat Data { get; set; }
+        public double LatencyMs { get; set; }
+    }
 
-    [Combinator]
-    [Description("Hyper-Optimized GPU Inference. Zero-Allocation, Red-Lined, and Shape-Safeguarded.")]
+    [Description("Hyper-Optimized CPU Inference. Timer Locked. Affinity Pinned.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class RippleDetectorGPU : IDisposable
+    public class RippleDetectorGPU : Transform<Mat, InferenceResult>, IDisposable
     {
         /* ───── Windows Kernel P/Invoke Hooks ───── */
+        [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint _controlfp_s(ref uint currentControl, uint newControl, uint mask);
+        const uint _MCW_DN = 0x03000000;
+        const uint _DN_FLUSH = 0x01000000;
+
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod", SetLastError = true)]
+        public static extern uint TimeBeginPeriod(uint uMilliseconds);
+
+        [DllImport("winmm.dll", EntryPoint = "timeEndPeriod", SetLastError = true)]
+        public static extern uint TimeEndPeriod(uint uMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
         [DllImport("kernel32.dll")]
         static extern IntPtr GetCurrentThread();
 
         [DllImport("kernel32.dll")]
         static extern IntPtr SetThreadAffinityMask(IntPtr hThread, IntPtr dwThreadAffinityMask);
 
-        [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-        public static extern uint _controlfp_s(ref uint currentControl, uint newControl, uint mask);
-
-        const uint _MCW_DN = 0x03000000;   // Denormal control mask
-        const uint _DN_FLUSH = 0x01000000; // Flush to zero
-
-        /* ───── User Properties ───── */
+        /* ───── UI Properties ───── */
         [Category("1. Model")]
         [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
-        [FileNameFilter("ONNX Models|*.onnx|All Files|*.*")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
 
-        [Category("2. Settings")] public OnnxProvider Provider { get; set; } = OnnxProvider.Cuda;
-        [Category("2. Settings")] public int DeviceId { get; set; } = 0;
         [Category("2. Settings")] public int IntraOpNumThreads { get; set; } = 1;
-        [Category("2. Settings")] public int InterOpNumThreads { get; set; } = 1;
+        [Category("3. Dimensions")] public int BatchSize { get; set; } = 1;
+        [Category("3. Dimensions")] public int TimePoints { get; set; } = 44;
+        [Category("3. Dimensions")] public int Channels { get; set; } = 8;
+        [Category("4. Hardware Control")] public bool AllowSpinning { get; set; } = true;
 
-        [Category("3. Dimensions (Must Match Input)")] public int BatchSize { get; set; } = 1;
-        [Category("3. Dimensions (Must Match Input)")] public int TimePoints { get; set; } = 44;
-        [Category("3. Dimensions (Must Match Input)")] public int Channels { get; set; } = 8;
-
-        [Category("4. Hardware & Red-Lining")]
-        [Description("The logical CPU core to lock the ONNX orchestrator thread to (e.g., 2).")]
-        public int CpuCoreAffinity { get; set; } = 2;
-
-        [Category("4. Hardware & Red-Lining")]
-        [Description("Runs the math EVERY frame to keep the PCIe bus awake, but only outputs a valid result every Nth frame.")]
-        public int RunInterval { get; set; } = 3;
-
-        [Category("4. Hardware & Red-Lining")]
-        public bool AllowSpinning { get; set; } = true;
-
-        /* ───── State & Buffers ───── */
+        /* ───── State ───── */
         private readonly object _inferenceLock = new object();
-        private bool _isThreadPinned = false;
-        private int _batchCounter = 0;
-
         private InferenceSession _session;
         private OrtIoBinding _binding;
         private RunOptions _runOpts;
-        private Stopwatch _timer = new Stopwatch();
-
+        private readonly Stopwatch _timer = new Stopwatch();
         private float[] _bufIn, _bufOut;
         private GCHandle _hIn, _hOut;
-        private Mat _resultMat;
         private OrtValue _valIn, _valOut;
-
+        private Mat _outMat;
         private int _inputStride;
-        private readonly List<Mat> _inputCache = new List<Mat>(2);
+        private int _expectedBytes;
+        private bool _isInitialized = false;
 
         private void InitializeSession()
         {
-            if (_session != null) return;
-            _inputStride = TimePoints * Channels;
+            if (_isInitialized) return;
 
-            // 1. Hardware Subnormal Float Flush 
+            // 1. Kernel Hooks
+            try { TimeBeginPeriod(1); } catch { }
             try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
+            try { SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, (IntPtr)(-1), (IntPtr)(-1)); } catch { }
+            try { System.Diagnostics.Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime; } catch { }
 
-            // 2. Process Escalation (Fully Qualified to avoid CS0119 collision)
-            try
-            {
-                using (var process = System.Diagnostics.Process.GetCurrentProcess())
-                    process.PriorityClass = ProcessPriorityClass.RealTime;
-                System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
-            }
-            catch { }
+            _inputStride = TimePoints * Channels;
+            _expectedBytes = _inputStride * sizeof(float);
 
-            // 3. Ultra-Lean ORT Config
+            // 2. ONNX Config
             var opts = new SessionOptions
             {
                 IntraOpNumThreads = IntraOpNumThreads,
-                InterOpNumThreads = InterOpNumThreads,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                EnableCpuMemArena = true,
-                EnableMemoryPattern = true
+                EnableCpuMemArena = false,
+                EnableMemoryPattern = false
             };
-
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
             opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
-            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
             opts.AddSessionConfigEntry("session.intra_op.allow_spinning", AllowSpinning ? "1" : "0");
-
-            try
-            {
-                if (Provider == OnnxProvider.TensorRT)
-                {
-                    Environment.SetEnvironmentVariable("ORT_TENSORRT_FP16_ENABLE", "1");
-                    opts.AppendExecutionProvider_Tensorrt(DeviceId);
-                    opts.AppendExecutionProvider_CUDA(DeviceId);
-                }
-                else if (Provider == OnnxProvider.Cuda)
-                {
-                    opts.AppendExecutionProvider_CUDA(DeviceId);
-                }
-            }
-            catch { Provider = OnnxProvider.Cpu; }
 
             _session = new InferenceSession(ModelPath, opts);
             _binding = _session.CreateIoBinding();
             _runOpts = new RunOptions();
             opts.Dispose();
 
-            long[] inShape = new long[] { BatchSize, TimePoints, Channels };
-            int inSize = BatchSize * TimePoints * Channels;
-
-            var outMeta = _session.OutputMetadata.Values.First();
-            long[] outShape = new long[outMeta.Dimensions.Length];
-            int outSize = 1;
-            for (int i = 0; i < outShape.Length; i++)
-            {
-                long d = outMeta.Dimensions[i];
-                if (d <= 0) d = (i == 0) ? BatchSize : 1;
-                outShape[i] = d;
-                outSize *= (int)d;
-            }
-
-            // 4. Pin memory and bind directly to OrtValues 
-            _bufIn = new float[inSize];
+            // 3. Memory
+            _bufIn = new float[BatchSize * _inputStride];
             _hIn = GCHandle.Alloc(_bufIn, GCHandleType.Pinned);
-
-            _bufOut = new float[outSize];
+            _bufOut = new float[BatchSize];
             _hOut = GCHandle.Alloc(_bufOut, GCHandleType.Pinned);
 
             var memInfo = OrtMemoryInfo.DefaultInstance;
+            _valIn = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), new long[] { BatchSize, TimePoints, Channels });
+            _valOut = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), new long[] { BatchSize, 1 });
 
-            _valIn = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), inShape);
-            _valOut = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), outShape);
-
-            // Bind explicitly to GPU I/O bindings to prevent PCIe copy overhead during Inference
             _binding.BindInput(_session.InputMetadata.Keys.First(), _valIn);
             _binding.BindOutput(_session.OutputMetadata.Keys.First(), _valOut);
 
-            int cols = outSize / BatchSize;
-            _resultMat = new Mat(BatchSize, cols, Depth.F32, 1, _hOut.AddrOfPinnedObject());
-
-            // 5. Deep Warmup: Crucial for TensorRT engine building and GPU VRAM allocation
-            for (int i = 0; i < 50; i++)
-            {
-                _session.RunWithBinding(_runOpts, _binding);
-            }
+            _outMat = new Mat(BatchSize, 1, Depth.F32, 1, _hOut.AddrOfPinnedObject());
+            _isInitialized = true;
         }
 
-        private Tuple<Mat, double> RunInference(IList<Mat> mats)
-        {
-            lock (_inferenceLock)
-            {
-                if (_session == null) InitializeSession();
-
-                // Lock Thread Affinity for the CPU Orchestrator
-                if (!_isThreadPinned)
-                {
-                    SetThreadAffinityMask(GetCurrentThread(), new IntPtr(1 << CpuCoreAffinity));
-                    _isThreadPinned = true;
-                }
-
-                if (mats.Count != BatchSize)
-                    throw new InvalidOperationException($"CRITICAL: Expected {BatchSize} Mats, but received {mats.Count}.");
-
-                unsafe
-                {
-                    float* dstBase = (float*)_hIn.AddrOfPinnedObject().ToPointer();
-                    int expectedElements = TimePoints * Channels;
-
-                    for (int i = 0; i < BatchSize; i++)
-                    {
-                        // THE GUARDRAIL: Prevents CLR 0xc0000005 crashes
-                        int actualElements = mats[i].Rows * mats[i].Cols;
-                        if (actualElements != expectedElements)
-                        {
-                            throw new InvalidOperationException(
-                                $"FATAL SHAPE MISMATCH: ONNX expects {expectedElements} elements ({TimePoints}x{Channels}), " +
-                                $"but received {actualElements} elements ({mats[i].Rows}x{mats[i].Cols}).");
-                        }
-
-                        float* src = (float*)mats[i].Data.ToPointer();
-                        float* dst = dstBase + (i * _inputStride);
-
-                        if (mats[i].Rows == TimePoints && mats[i].Cols == Channels)
-                        {
-                            Buffer.MemoryCopy(src, dst, _inputStride * sizeof(float), _inputStride * sizeof(float));
-                        }
-                        else if (mats[i].Rows == Channels && mats[i].Cols == TimePoints)
-                        {
-                            for (int c = 0; c < Channels; c++)
-                                for (int t = 0; t < TimePoints; t++)
-                                    dst[(t * Channels) + c] = src[(c * TimePoints) + t];
-                        }
-                    }
-                }
-
-                // THE GHOST RUN: Keep the PCIe bus and GPU active
-                _timer.Restart();
-                _session.RunWithBinding(_runOpts, _binding);
-                _timer.Stop();
-
-                _batchCounter++;
-
-                if (_batchCounter >= RunInterval)
-                {
-                    _batchCounter = 0;
-                    return Tuple.Create(_resultMat, _timer.Elapsed.TotalMilliseconds);
-                }
-
-                // Silent drop for Ghost Runs
-                return null;
-            }
-        }
-
-        // --- OVERLOADS ---
-        public IObservable<Tuple<Mat, double>> Process(IObservable<Mat> source)
+        public override IObservable<InferenceResult> Process(IObservable<Mat> source)
         {
             return source.Select(m =>
             {
                 lock (_inferenceLock)
                 {
-                    _inputCache.Clear();
-                    _inputCache.Add(m);
-                    return RunInference(_inputCache);
-                }
-            }).Where(res => res != null); // Drop invalid Ghost Runs
-        }
+                    if (!_isInitialized) InitializeSession();
+                    SetThreadAffinityMask(GetCurrentThread(), (IntPtr)(1L << 0));
 
-        public IObservable<Tuple<Mat, double>> Process(IObservable<Tuple<Mat, Mat>> source)
-        {
-            return source.Select(t =>
-            {
-                lock (_inferenceLock)
-                {
-                    _inputCache.Clear();
-                    _inputCache.Add(t.Item1);
-                    _inputCache.Add(t.Item2);
-                    return RunInference(_inputCache);
-                }
-            }).Where(res => res != null);
-        }
+                    unsafe
+                    {
+                        float* dst = (float*)_hIn.AddrOfPinnedObject().ToPointer();
+                        Buffer.MemoryCopy(m.Data.ToPointer(), dst, _expectedBytes, _expectedBytes);
+                    }
 
-        public IObservable<Tuple<Mat, double>> Process(IObservable<IList<Mat>> source)
-        {
-            return source.Select(batch => RunInference(batch)).Where(res => res != null);
+                    _timer.Restart();
+                    _session.RunWithBinding(_runOpts, _binding);
+                    _timer.Stop();
+
+                    return new InferenceResult { Data = _outMat, LatencyMs = _timer.Elapsed.TotalMilliseconds, IsValid = true };
+                }
+            });
         }
 
         public void Dispose()
         {
-            if (_hIn.IsAllocated) _hIn.Free();
-            if (_hOut.IsAllocated) _hOut.Free();
-
-            _valIn?.Dispose();
-            _valOut?.Dispose();
-            _binding?.Dispose();
-            _runOpts?.Dispose();
-            _session?.Dispose();
-            _inputCache.Clear();
+            lock (_inferenceLock)
+            {
+                if (_hIn.IsAllocated) _hIn.Free();
+                if (_hOut.IsAllocated) _hOut.Free();
+                _session?.Dispose();
+                _outMat = null;
+                try { TimeEndPeriod(1); } catch { }
+            }
         }
     }
 }

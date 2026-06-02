@@ -8,7 +8,7 @@ using System.Runtime.InteropServices;
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Zero-Allocation Sliding-window z-score. Uses unmanaged pointers. No GC Spikes.")]
+    [Description("Zero-Allocation Sliding-window z-score. Uses unmanaged pointers with Float-Drift Protection.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class SlidingWindowZScore : IDisposable
     {
@@ -74,6 +74,23 @@ namespace DeepBrainInterface
                             float oldValue = (_samplesSeen < WindowSize) ? 0f : _history[historyOffset];
                             _sum[i] -= oldValue;
                             _sumSq[i] -= (double)oldValue * oldValue;
+
+                            // ---> ANTI-DRIFT BLOCK <---
+                            // Once every full window cycle, do a hard recalculation to zero-out float drift
+                            if (_writeIndex == 0 && _samplesSeen >= WindowSize)
+                            {
+                                double freshSum = 0, freshSumSq = 0;
+                                int baseIdx = i * WindowSize;
+                                for (int j = 0; j < WindowSize; j++)
+                                {
+                                    float val = _history[baseIdx + j];
+                                    freshSum += val;
+                                    freshSumSq += (double)val * val;
+                                }
+                                _sum[i] = freshSum;
+                                _sumSq[i] = freshSumSq;
+                            }
+                            // --------------------------
 
                             _history[historyOffset] = newValue;
                             _sum[i] += newValue;
