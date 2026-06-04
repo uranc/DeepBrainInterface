@@ -16,7 +16,7 @@ namespace DeepBrainInterface
         public float Score { get; set; }
         public int EventCount { get; set; }
         public float Probability { get; set; }
-        public Mat SignalData { get; set; }
+        //public Mat SignalData { get; set; }
         public float ArtifactProbability { get; set; }
         public int StrideUsed { get; set; }
     }
@@ -231,7 +231,7 @@ namespace DeepBrainInterface
                 ArtifactProbability = artProb,
                 EventCount = _eventCount,
                 TTL = ttl,
-                SignalData = data,
+                //SignalData = data,
                 StrideUsed = 0
             };
         }

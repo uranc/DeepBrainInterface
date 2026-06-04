@@ -3,121 +3,83 @@ using OpenCV.Net;
 using System;
 using System.ComponentModel;
 using System.Reactive.Linq;
-using System.Runtime.InteropServices;
 
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Zero-Allocation Sliding-window z-score. Uses unmanaged pointers with Float-Drift Protection.")]
+    [Description("Applies a running Z-Score using a pure mathematical counter. Strict F32 input. Zero ring buffers.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
-    public class SlidingWindowZScore : IDisposable
+    public class SlidingWindowZScore
     {
-        [Description("Number of samples to keep in the sliding window.")]
+        [Description("The history counter limit used to weight the running mean and variance. Defaults to 1250.")]
         public int WindowSize { get; set; } = 1250;
-
-        [Description("Number of channels (rows) in each incoming Mat.")]
-        public int Channels { get; set; } = 8;
-
-        private readonly object _lock = new object();
-        private bool _initialized = false;
-
-        private float[] _history;
-        private double[] _sum;
-        private double[] _sumSq;
-        private int _writeIndex = 0;
-        private int _samplesSeen = 0;
-
-        private float[] _outBuffer;
-        private GCHandle _hOutBuffer;
-        private Mat _outMat;
-
-        private void Initialize()
-        {
-            if (_initialized) return;
-
-            _history = new float[Channels * WindowSize];
-            _sum = new double[Channels];
-            _sumSq = new double[Channels];
-
-            _outBuffer = new float[Channels];
-            _hOutBuffer = GCHandle.Alloc(_outBuffer, GCHandleType.Pinned);
-            _outMat = new Mat(Channels, 1, Depth.F32, 1, _hOutBuffer.AddrOfPinnedObject());
-
-            _writeIndex = 0;
-            _samplesSeen = 0;
-            _initialized = true;
-        }
 
         public IObservable<Mat> Process(IObservable<Mat> source)
         {
-            return source.Select(input =>
+            return Observable.Defer(() =>
             {
-                lock (_lock)
+                // Pure state trackers. No raw data is hoarded.
+                float[] means = null;
+                float[] variances = null;
+                int count = 0;
+
+                Mat outputMat = null;
+
+                return source.Select(input =>
                 {
-                    if (!_initialized) Initialize();
+                    int channels = input.Rows;
+                    int incomingSamples = input.Cols;
 
-                    if (input.Rows != Channels || input.Cols != 1 || input.Depth != Depth.F32)
-                        throw new ArgumentException("Input must be a 32-bit float Mat with shape [Channels x 1]");
+                    // Initialize trackers exactly once
+                    if (means == null)
+                    {
+                        means = new float[channels];
+                        variances = new float[channels];
+                        count = 0;
+                    }
 
-                    int count = Math.Min(_samplesSeen, WindowSize);
+                    // Only reallocate the output matrix if the batch size physically changes
+                    if (outputMat == null || outputMat.Cols != incomingSamples)
+                    {
+                        outputMat = new Mat(channels, incomingSamples, Depth.F32, 1);
+                    }
 
                     unsafe
                     {
-                        float* src = (float*)input.Data.ToPointer();
-                        float* dst = (float*)_hOutBuffer.AddrOfPinnedObject().ToPointer();
+                        // Direct cast, trusting the upstream F32 contract
+                        float* inData = (float*)input.Data.ToPointer();
+                        float* outData = (float*)outputMat.Data.ToPointer();
 
-                        for (int i = 0; i < Channels; i++)
+                        // Step through timepoints chronologically to pool batches dynamically
+                        for (int t = 0; t < incomingSamples; t++)
                         {
-                            float newValue = src[i];
-                            int historyOffset = (i * WindowSize) + _writeIndex;
+                            if (count < WindowSize) count++;
+                            float alpha = 1.0f / count;
+                            float oneMinusAlpha = 1.0f - alpha;
 
-                            float oldValue = (_samplesSeen < WindowSize) ? 0f : _history[historyOffset];
-                            _sum[i] -= oldValue;
-                            _sumSq[i] -= (double)oldValue * oldValue;
-
-                            // ---> ANTI-DRIFT BLOCK <---
-                            // Once every full window cycle, do a hard recalculation to zero-out float drift
-                            if (_writeIndex == 0 && _samplesSeen >= WindowSize)
+                            for (int c = 0; c < channels; c++)
                             {
-                                double freshSum = 0, freshSumSq = 0;
-                                int baseIdx = i * WindowSize;
-                                for (int j = 0; j < WindowSize; j++)
-                                {
-                                    float val = _history[baseIdx + j];
-                                    freshSum += val;
-                                    freshSumSq += (double)val * val;
-                                }
-                                _sum[i] = freshSum;
-                                _sumSq[i] = freshSumSq;
+                                int idx = c * incomingSamples + t;
+                                float val = inData[idx];
+
+                                // Exponential Moving Average (EMA) Update
+                                float diff = val - means[c];
+                                means[c] += alpha * diff;
+                                variances[c] = oneMinusAlpha * (variances[c] + alpha * diff * diff);
+
+                                float std = (float)Math.Sqrt(variances[c]);
+                                if (std < 1e-6f) std = 1f; // Prevent division by zero flatlines
+
+                                // Apply Z-Score directly
+                                outData[idx] = (val - means[c]) / std;
                             }
-                            // --------------------------
-
-                            _history[historyOffset] = newValue;
-                            _sum[i] += newValue;
-                            _sumSq[i] += (double)newValue * newValue;
-
-                            int n_t = Math.Max(1, count);
-                            double mu = _sum[i] / n_t;
-                            double avgSq = _sumSq[i] / n_t;
-                            double variance = Math.Max(0, avgSq - (mu * mu));
-                            double sigma = Math.Max(1e-10, Math.Sqrt(variance));
-
-                            dst[i] = (float)((newValue - mu) / sigma);
                         }
                     }
 
-                    _writeIndex = (_writeIndex + 1) % WindowSize;
-                    _samplesSeen++;
-
-                    return _outMat;
-                }
+                    // Clone kept purely to protect the upstream dsp:Buffer from overlapping memory writes
+                    return outputMat.Clone();
+                });
             });
-        }
-
-        public void Dispose()
-        {
-            if (_hOutBuffer.IsAllocated) _hOutBuffer.Free();
-            _initialized = false;
         }
     }
 }
