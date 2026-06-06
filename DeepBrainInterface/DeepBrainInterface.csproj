@@ -13,7 +13,7 @@
 
 		<TargetFramework>net472</TargetFramework>
 		<Features>strict</Features>
-		<Version>1.1.46</Version>
+		<Version>1.1.48</Version>
 
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<Platforms>x64</Platforms>
