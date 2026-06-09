@@ -19,6 +19,7 @@ namespace DeepBrainInterface
         //public Mat SignalData { get; set; }
         public float ArtifactProbability { get; set; }
         public int StrideUsed { get; set; }
+        public ulong Clock { get; set; }  // hardware clock (uint64) of the freshest sample in the detecting window
     }
 
     [Combinator]
