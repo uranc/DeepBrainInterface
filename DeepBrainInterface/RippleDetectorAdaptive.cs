@@ -1,4 +1,4 @@
-﻿using Bonsai;
+using Bonsai;
 using Microsoft.ML.OnnxRuntime;
 using OpenCV.Net;
 using System;
@@ -11,11 +11,9 @@ using System.Diagnostics;
 
 namespace DeepBrainInterface
 {
-    //public enum RippleState { NoRipple, Possible, Ripple }
-
-
     [Combinator]
-    [Description("God Node: Downsampling -> Adaptive Z-Score -> ONNX -> Leaky Bucket FSM.")]
+    [Description("God Node: block-rate raw input -> internal decimation -> rectangular adaptive Z-Score " +
+                 "-> linear sliding-window ONNX -> Leaky Bucket FSM. Zero per-sample allocation.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorAdaptive : IDisposable
     {
@@ -37,16 +35,21 @@ namespace DeepBrainInterface
         [Category("2. Signal Timing")] public int TimePoints { get; set; } = 44;
 
         [Category("2. Signal Timing")]
-        [Description("Downsample factor. (e.g., 12 turns 30kHz into 2.5kHz)")]
+        [Description("Downsample factor applied to the incoming full-rate stream. (e.g., 12 turns 30kHz into 2.5kHz)")]
         public int DecimationFactor { get; set; } = 12;
 
         [Category("2. Signal Timing")]
-        [Description("How many 2.5kHz samples to wait before running inference again. (e.g., 2)")]
-        public int InferenceStride { get; set; } = 2;
+        [Description("How many decimated samples to wait before running inference again. (e.g., 2 or 3)")]
+        public int InferenceStride { get; set; } = 3;
 
         // --- UI CATEGORY 3: Adaptive Z-Score ---
         [Category("3. Adaptive Z-Score")] public int BaselineWindowSize { get; set; } = 1250;
         [Category("3. Adaptive Z-Score")] public bool FreezeBaselineDuringRipple { get; set; } = true;
+
+        [Category("3. Adaptive Z-Score")]
+        [Description("Scale applied to the z-scored value before the model. Set to match training " +
+                     "(your previous pipeline used 0.5). 1.0 = pure z-score.")]
+        public float ZScoreOutputScale { get; set; } = 1.0f;
 
         // --- UI CATEGORY 4: Thresholds ---
         [Category("4. Thresholds")] public float Threshold1_IgnoreBelow { get; set; } = 0.10f;
@@ -61,29 +64,32 @@ namespace DeepBrainInterface
         // --- UI CATEGORY 6: Hardware TTL ---
         [Category("6. Hardware TTL")] public int PostRippleRefractoryMs { get; set; } = 50;
 
-
         // --- INTERNAL STATE ---
         private readonly object _engineLock = new object();
         private bool _isInitialized = false;
 
+        // Structural sizes captured at init (buffers are allocated once).
+        private int _channels;
+        private int _timePoints;
+        private int _baselineWindow;
+
         // 1. Downsample State
         private int _decimationCounter = 0;
 
-        // 2. Z-Score State
-        private float[] _zHistory;
+        // 2. Z-Score State (per-channel rolling rectangular window, double accumulators)
+        private float[] _zHistory;       // [c * _baselineWindow + ringIndex]
         private double[] _zSum;
         private double[] _zSumSq;
         private int _zWriteIndex = 0;
         private int _zSamplesSeen = 0;
 
-        // 3. ONNX State
+        // 3. ONNX State — _bufIn is a LINEAR, time-major sliding window [TimePoints, Channels]
         private InferenceSession _session;
         private OrtIoBinding _binding;
         private RunOptions _runOpts;
         private float[] _bufIn, _bufOut;
         private GCHandle _hIn, _hOut;
         private OrtValue _valIn, _valOut;
-        private int _onnxWriteIndex = 0;
         private int _strideCounter = 0;
 
         // 4. FSM State
@@ -112,23 +118,26 @@ namespace DeepBrainInterface
             }
             catch { }
 
-            // 1. Init Z-Score
-            _zHistory = new float[Channels * BaselineWindowSize];
-            _zSum = new double[Channels];
-            _zSumSq = new double[Channels];
+            _channels = Channels;
+            _timePoints = TimePoints;
+            _baselineWindow = BaselineWindowSize;
 
-            // 2. Init ONNX Ring Buffer & Memory
-            int inSize = TimePoints * Channels;
-            _bufIn = new float[inSize];
+            // 1. Z-Score buffers
+            _zHistory = new float[_channels * _baselineWindow];
+            _zSum = new double[_channels];
+            _zSumSq = new double[_channels];
+
+            // 2. ONNX linear window + output, pinned
+            _bufIn = new float[_timePoints * _channels];
             _hIn = GCHandle.Alloc(_bufIn, GCHandleType.Pinned);
-
-            _bufOut = new float[1]; // Assuming single probability float output
+            _bufOut = new float[1]; // single probability output
             _hOut = GCHandle.Alloc(_bufOut, GCHandleType.Pinned);
 
             var opts = new SessionOptions
             {
                 IntraOpNumThreads = 1,
                 InterOpNumThreads = 1,
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
                 EnableCpuMemArena = true,
@@ -136,6 +145,8 @@ namespace DeepBrainInterface
             };
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
             opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
+            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
+            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", "1");
 
             if (UseCUDA) opts.AppendExecutionProvider_CUDA(DeviceId);
 
@@ -144,7 +155,7 @@ namespace DeepBrainInterface
             _runOpts = new RunOptions();
             opts.Dispose();
 
-            long[] inShape = new long[] { 1, TimePoints, Channels };
+            long[] inShape = new long[] { 1, _timePoints, _channels };
             long[] outShape = new long[] { 1, 1 };
 
             var memInfo = OrtMemoryInfo.DefaultInstance;
@@ -159,6 +170,97 @@ namespace DeepBrainInterface
             _currentOutput = new RippleOut { State = RippleState.NoRipple, TTL = false };
             _isInitialized = true;
             Clock.Restart();
+        }
+
+        public IObservable<RippleOut> Process(IObservable<Mat> source)
+        {
+            return source.Select(input =>
+            {
+                lock (_engineLock)
+                {
+                    if (!_isInitialized) InitializeEngine();
+
+                    int channels = _channels;
+                    int timePoints = _timePoints;
+                    int baseWin = _baselineWindow;
+                    int decim = DecimationFactor < 1 ? 1 : DecimationFactor;
+                    int stride = InferenceStride < 1 ? 1 : InferenceStride;
+                    float zScale = ZScoreOutputScale;
+
+                    int nCols = input.Cols;
+                    int rowStep = input.Step;          // bytes per channel-major row
+                    if (input.Rows < channels)
+                        throw new InvalidOperationException(
+                            $"Input has {input.Rows} rows but Channels={channels}. Feed a [Channels x N] " +
+                            $"channel-major Mat (use SelectChannels upstream).");
+
+                    int shiftBytes = (timePoints - 1) * channels * sizeof(float);
+
+                    unsafe
+                    {
+                        byte* baseB = (byte*)input.Data.ToPointer();
+                        float* win = (float*)_hIn.AddrOfPinnedObject().ToPointer();
+
+                        // Walk every incoming sample (column) so this node can sit directly on the
+                        // block-rate raw stream — no upstream Buffer(1) explosion, zero allocation.
+                        for (int t = 0; t < nCols; t++)
+                        {
+                            // --- 1. DECIMATION (phase persists across blocks) ---
+                            if (++_decimationCounter < decim) continue;
+                            _decimationCounter = 0;
+
+                            bool freeze = FreezeBaselineDuringRipple &&
+                                          (_fsmState == RippleState.Ripple || _ttlHolding);
+                            int n_t = _zSamplesSeen < 1 ? 1 : _zSamplesSeen;
+
+                            // --- 2. Slide the linear time-major window left by one timepoint ---
+                            //     (left shift => forward copy is safe for overlapping regions)
+                            Buffer.MemoryCopy(win + channels, win, shiftBytes, shiftBytes);
+                            float* newSlot = win + (timePoints - 1) * channels;
+
+                            // --- 3. Adaptive rectangular Z-Score + ingest newest sample ---
+                            for (int c = 0; c < channels; c++)
+                            {
+                                float newValue = *(float*)(baseB + c * rowStep + t * sizeof(float));
+                                int histOff = c * baseWin + _zWriteIndex;
+
+                                if (!freeze)
+                                {
+                                    float oldValue = (_zSamplesSeen < baseWin) ? 0f : _zHistory[histOff];
+                                    _zSum[c]   += newValue - oldValue;
+                                    _zSumSq[c] += (double)newValue * newValue - (double)oldValue * oldValue;
+                                    _zHistory[histOff] = newValue;
+                                }
+
+                                double mu = _zSum[c] / n_t;
+                                double variance = Math.Max(0.0, _zSumSq[c] / n_t - mu * mu);
+                                double sigma = Math.Max(1e-10, Math.Sqrt(variance));
+                                newSlot[c] = (float)(((newValue - mu) / sigma) * zScale);
+                            }
+
+                            if (!freeze)
+                            {
+                                _zWriteIndex = (_zWriteIndex + 1) % baseWin;
+                                if (_zSamplesSeen < baseWin) _zSamplesSeen++;
+                            }
+
+                            // --- 4. Inference on a fully chronological window, on stride ---
+                            if (++_strideCounter >= stride)
+                            {
+                                _strideCounter = 0;
+                                if (_zSamplesSeen >= timePoints) // window holds real data
+                                {
+                                    _session.RunWithBinding(_runOpts, _binding);
+                                    float prob = *((float*)_hOut.AddrOfPinnedObject().ToPointer());
+                                    RunFSM(prob);
+                                }
+                            }
+                        }
+                    }
+
+                    return _currentOutput;
+                }
+            });
         }
 
         private void RunFSM(float probability)
@@ -258,110 +360,6 @@ namespace DeepBrainInterface
             _currentOutput.EventCount = _eventCount;
         }
 
-        public IObservable<RippleOut> Process(IObservable<Mat> source)
-        {
-            return source.Select(input =>
-            {
-                lock (_engineLock)
-                {
-                    if (!_isInitialized) InitializeEngine();
-
-                    // --- 1. DECIMATION ---
-                    _decimationCounter++;
-                    if (_decimationCounter < DecimationFactor)
-                    {
-                        return _currentOutput; // Yield previous state instantly
-                    }
-                    _decimationCounter = 0;
-
-                    // --- 2. ADAPTIVE Z-SCORE ---
-                    bool freezeZScore = FreezeBaselineDuringRipple && (_fsmState == RippleState.Ripple || _ttlHolding);
-                    int zCount = Math.Min(_zSamplesSeen, BaselineWindowSize);
-
-                    unsafe
-                    {
-                        float* src = (float*)input.Data.ToPointer();
-                        float* onnxBufferBase = (float*)_hIn.AddrOfPinnedObject().ToPointer();
-
-                        for (int c = 0; c < Channels; c++)
-                        {
-                            float newValue = src[c];
-                            int historyOffset = (c * BaselineWindowSize) + _zWriteIndex;
-
-                            // Adaptive Update
-                            if (!freezeZScore)
-                            {
-                                float oldValue = (_zSamplesSeen < BaselineWindowSize) ? 0f : _zHistory[historyOffset];
-                                _zSum[c] -= oldValue;
-                                _zSumSq[c] -= (double)oldValue * oldValue;
-
-                                // Anti-drift block
-                                if (_zWriteIndex == 0 && _zSamplesSeen >= BaselineWindowSize)
-                                {
-                                    double freshSum = 0, freshSumSq = 0;
-                                    int baseIdx = c * BaselineWindowSize;
-                                    for (int j = 0; j < BaselineWindowSize; j++)
-                                    {
-                                        float val = _zHistory[baseIdx + j];
-                                        freshSum += val;
-                                        freshSumSq += (double)val * val;
-                                    }
-                                    _zSum[c] = freshSum;
-                                    _zSumSq[c] = freshSumSq;
-                                }
-
-                                _zHistory[historyOffset] = newValue;
-                                _zSum[c] += newValue;
-                                _zSumSq[c] += (double)newValue * newValue;
-                            }
-
-                            // Normalization
-                            int n_t = Math.Max(1, zCount);
-                            double mu = _zSum[c] / n_t;
-                            double avgSq = _zSumSq[c] / n_t;
-                            double variance = Math.Max(0, avgSq - (mu * mu));
-                            double sigma = Math.Max(1e-10, Math.Sqrt(variance));
-                            float zScoredValue = (float)((newValue - mu) / sigma);
-
-                            // --- 3. ONNX RING BUFFER INGESTION ---
-                            // Write directly to the ONNX pinned memory at the current timepoint
-                            int targetIndex = (_onnxWriteIndex * Channels) + c;
-                            onnxBufferBase[targetIndex] = zScoredValue;
-                        }
-
-                        if (!freezeZScore)
-                        {
-                            _zWriteIndex = (_zWriteIndex + 1) % BaselineWindowSize;
-                            _zSamplesSeen++;
-                        }
-
-                        _onnxWriteIndex = (_onnxWriteIndex + 1) % TimePoints;
-                    }
-
-                    // --- 4. INFERENCE STRIDE TRIGGER ---
-                    _strideCounter++;
-                    if (_strideCounter >= InferenceStride)
-                    {
-                        _strideCounter = 0;
-
-                        // We do NOT need to reshape the buffer because ONNX doesn't care where "time zero" is
-                        // as long as the neural network is trained on sliding windows. 
-                        // If it strictly requires time-chronological ordering, we would shift it here.
-
-                        _session.RunWithBinding(_runOpts, _binding);
-
-                        unsafe
-                        {
-                            float prob = *((float*)_hOut.AddrOfPinnedObject().ToPointer());
-                            RunFSM(prob);
-                        }
-                    }
-
-                    return _currentOutput;
-                }
-            });
-        }
-
         public void Dispose()
         {
             lock (_engineLock)
@@ -373,6 +371,11 @@ namespace DeepBrainInterface
                 _binding?.Dispose();
                 _runOpts?.Dispose();
                 _session?.Dispose();
+                _valIn = null;
+                _valOut = null;
+                _binding = null;
+                _runOpts = null;
+                _session = null;
                 _isInitialized = false;
             }
         }
