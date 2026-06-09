@@ -222,6 +222,21 @@ namespace DeepBrainInterface
             return source.Select(batch => RunInference(batch));
         }
 
+        // Clock pass-through: Zip(Buffer(44,3), Rhd2164.Clock) -> RippleDetectorCPU
+        // -> Tuple<probability Mat, ulong clock> for downstream RippleStateMachineMatBool or SuperNode.
+        public IObservable<Tuple<Mat, ulong>> Process(IObservable<Tuple<Mat, ulong>> source)
+        {
+            return source.Select(t =>
+            {
+                lock (_inferenceLock)
+                {
+                    _inputCache.Clear();
+                    _inputCache.Add(t.Item1);
+                    return Tuple.Create(RunInference(_inputCache), t.Item2);
+                }
+            });
+        }
+
         private void ReleaseAllocations()
         {
             if (_hIn.IsAllocated) _hIn.Free();

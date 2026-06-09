@@ -13,11 +13,30 @@ using System.Threading;
 
 namespace DeepBrainInterface
 {
+    // Drop-in replacement for RippleDetectorGPU + RippleStateMachineMatBool.
+    //
+    // What's the same as the existing workflow:
+    //   - Accepts the same windowed z-scored [Channels x TimePoints] Mat (output of Buffer(44,3))
+    //   - Accepts the same BNO gate (bool from BitwiseNot -> StartWithBool(false))
+    //   - Outputs identical RippleOut (same struct, same FSM via RippleStateMachineMatBool.Update)
+    //
+    // What's new:
+    //   - Acquisition thread writes windows into a small lock-free ring instead of blocking on ONNX
+    //   - Background thread (pinned, RealTime) runs ONNX + FSM; skips ONNX during TTL refractory
+    //   - Accepts optional ulong clock per window so RippleOut.Clock tracks which frame triggered detection
+    //
+    // Wiring (replaces GPU node + FSM node):
+    //   Buffer(44,3)
+    //     -> [optional] Zip with Rhd2164.Clock       => Tuple<Mat, ulong>
+    //     -> [optional] WithLatestFrom(BNO gate)      => Tuple<Tuple<Mat, ulong>, bool>
+    //     -> RippleDetectorSuperNode
+    //     -> TTL -> DigitalOutput
+
     [Combinator]
-    [Description("EXPERIMENTAL decoupled God node. Acquisition thread casts U16->F32, decimates and z-scores " +
-                 "into a lock-free ring (+ parallel clock ring); a pinned RealTime background thread skips to the " +
-                 "freshest window, runs zero-alloc ONNX + FSM, and emits RippleOut. Inference is skipped during the " +
-                 "TTL refractory. Accepts a (data, clock) Zip so detections carry the hardware sample clock.")]
+    [Description("Ring-buffered drop-in for RippleDetectorGPU + RippleStateMachineMatBool. " +
+                 "Acquisition thread writes windowed z-scored Mats into a lock-free ring; " +
+                 "a pinned RealTime background thread runs zero-alloc ONNX + FSM, " +
+                 "skipping ONNX during the TTL refractory. Output is identical RippleOut.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorSuperNode : IDisposable
     {
@@ -31,108 +50,69 @@ namespace DeepBrainInterface
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
         [DllImport("kernel32.dll")] static extern IntPtr SetThreadAffinityMask(IntPtr hThread, IntPtr dwThreadAffinityMask);
 
-        // --- 1. Model ---
+        // --- 1. Model (same as RippleDetectorGPU) ---
         [Category("1. Model")]
         [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
         [Category("1. Model")] public int TimePoints { get; set; } = 44;
         [Category("1. Model")] public int Channels { get; set; } = 8;
 
-        // --- 2. Signal Timing ---
-        [Category("2. Signal Timing")]
-        [Description("Downsample factor on the incoming full-rate stream (e.g. 12 => 30kHz -> 2.5kHz).")]
-        public int DecimationFactor { get; set; } = 12;
-        [Category("2. Signal Timing")]
-        [Description("Run inference whenever this many new decimated samples have arrived (stride). 3 => Buffer(44,3).")]
-        public int InferenceStride { get; set; } = 3;
+        // --- 2. FSM (same settings as RippleStateMachineMatBool) ---
+        [Category("2. FSM")]
+        [Description("State machine — identical to RippleStateMachineMatBool. Expand to configure.")]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+        public RippleStateMachineMatBool FSM { get; set; } = new RippleStateMachineMatBool();
 
-        // --- 3. Adaptive Z-Score ---
-        [Category("3. Adaptive Z-Score")] public int BaselineWindowSize { get; set; } = 1250;
-        [Category("3. Adaptive Z-Score")]
-        [Description("Scale applied to the z-scored value before the model. Match training (1.0 = pure z).")]
-        public float ZScoreOutputScale { get; set; } = 1.0f;
-
-        // --- 4. Thresholds ---
-        [Category("4. Thresholds")] public float Threshold1_IgnoreBelow { get; set; } = 0.10f;
-        [Category("4. Thresholds")] public float Threshold2_WeakEvidence { get; set; } = 0.50f;
-        [Category("4. Thresholds")] public float Threshold3_StrongEvidence { get; set; } = 0.80f;
-        [Category("4. Thresholds")] public float TargetEvidenceScore { get; set; } = 5.0f;
-
-        // --- 5. Anti-Flicker ---
-        [Category("5. Anti-Flicker")] public int FramesToWaitBeforeDecay { get; set; } = 5;
-        [Category("5. Anti-Flicker")] public float ScoreDecayPerFrame { get; set; } = 1.0f;
-
-        // --- 6. Hardware TTL ---
-        [Category("6. Hardware TTL")]
-        [Description("Refractory hold after a detection. Inference is SKIPPED during this window (free headroom).")]
-        public int PostRippleRefractoryMs { get; set; } = 150;
-
-        // --- 7. Hardware Tuning ---
-        [Category("7. Hardware Tuning")]
-        [Description("Pin the inference thread to this core. -1 disables. Busy-spin pegs it.")]
+        // --- 3. Hardware Tuning (same as RippleDetectorGPU) ---
+        [Category("3. Hardware Tuning")]
+        [Description("Pin the inference thread to this core. -1 disables.")]
         public int TargetCore { get; set; } = 7;
-        [Category("7. Hardware Tuning")]
-        [Description("Busy-spin for lowest pickup latency (pegs TargetCore). False = SpinOnce.")]
+        [Category("3. Hardware Tuning")]
+        [Description("Busy-spin for lowest latency (pegs TargetCore). False = SpinOnce (yields CPU).")]
         public bool BusySpin { get; set; } = true;
-        [Category("7. Hardware Tuning")]
+        [Category("3. Hardware Tuning")]
         public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.RealTime;
 
-        // Ring of z-scored decimated samples + parallel ring of sample clocks.
-        private const int RingSize = 1024;
-        private float[] _ring;
-        private GCHandle _hRing;
-        private ulong[] _clockRing;
+        // Ring of pre-allocated inference windows.
+        // Power of 2. 32 slots @ 833 Hz = ~38 ms of buffering — enough for a GC pause.
+        private const int RingSlots = 32;
+        private float[][] _windowRing;   // pre-allocated [slot][TimePoints * Channels]
+        private ulong[]   _clockRing;    // hardware clock per slot
+        private bool[]    _gateRing;     // BNO gate per slot
         private volatile int _writeHead;
-        private long _written;
-        private long _sampleIndex;
-        private int _channels, _timePoints, _baselineWindow;
-
-        // Z-score state (writer thread only)
-        private float[] _zHistory;
-        private double[] _zSum, _zSumSq;
-        private int _zWriteIndex, _zSamplesSeen, _decimationCounter;
-
-        // FSM state (background thread only)
-        private RippleState _fsmState = RippleState.NoRipple;
-        private float _scoreTicks;
-        private int _ticksDipping, _eventCount;
-        private bool _ttlHolding;
-        private long _ttlHoldUntilMs;
-        private static readonly Stopwatch Clock = Stopwatch.StartNew();
-        private RippleOut _currentOutput;
+        private volatile int _readHead;
 
         private CancellationTokenSource _cts;
+        private bool _lastTTL;           // used to detect refractory on background thread
 
-        // Single-stream input (clock falls back to a decimated-sample index).
+        // ----- Process overloads — same input signatures as GPU + FSM -----
+
+        // Same as RippleDetectorGPU: windowed z-scored [Channels x TimePoints] Mat only.
         public IObservable<RippleOut> Process(IObservable<Mat> source) =>
-            Run(observer => source.Subscribe(m => WriteBlock(m, null), observer.OnError));
+            Run(observer => source.Subscribe(m => Enqueue(m, 0UL, true), observer.OnError));
 
-        // Zipped (data, clock) input: detections carry the hardware sample clock (onix Clock is ulong[]).
-        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong[]>> source) =>
-            Run(observer => source.Subscribe(t => WriteBlock(t.Item1, t.Item2), observer.OnError));
+        // With BNO gate: mirrors WithLatestFrom(gate) -> RippleStateMachineMatBool wiring.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source) =>
+            Run(observer => source.Subscribe(t => Enqueue(t.Item1, 0UL, t.Item2), observer.OnError));
+
+        // With hardware clock (Zip data with Rhd2164.Clock) — no gate.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source) =>
+            Run(observer => source.Subscribe(t => Enqueue(t.Item1, t.Item2, true), observer.OnError));
+
+        // Full: Zip(data, clock) -> WithLatestFrom(BNO gate).
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source) =>
+            Run(observer => source.Subscribe(t => Enqueue(t.Item1.Item1, t.Item1.Item2, t.Item2), observer.OnError));
 
         private IObservable<RippleOut> Run(Func<IObserver<RippleOut>, IDisposable> subscribe)
         {
             return Observable.Create<RippleOut>(observer =>
             {
-                _channels = Channels;
-                _timePoints = TimePoints;
-                _baselineWindow = BaselineWindowSize;
-
-                _ring = new float[RingSize * _channels];
-                _hRing = GCHandle.Alloc(_ring, GCHandleType.Pinned);
-                _clockRing = new ulong[RingSize];
-                _writeHead = 0; _written = 0; _sampleIndex = 0;
-
-                _zHistory = new float[_channels * _baselineWindow];
-                _zSum = new double[_channels];
-                _zSumSq = new double[_channels];
-                _zWriteIndex = _zSamplesSeen = _decimationCounter = 0;
-
-                _fsmState = RippleState.NoRipple;
-                _scoreTicks = 0; _ticksDipping = 0; _eventCount = 0; _ttlHolding = false;
-                _currentOutput = new RippleOut { State = RippleState.NoRipple, TTL = false };
-                Clock.Restart();
+                int windowSize = TimePoints * Channels;
+                _windowRing = new float[RingSlots][];
+                for (int i = 0; i < RingSlots; i++) _windowRing[i] = new float[windowSize];
+                _clockRing = new ulong[RingSlots];
+                _gateRing  = new bool[RingSlots];
+                _writeHead = 0; _readHead = 0; _lastTTL = false;
 
                 _cts = new CancellationTokenSource();
                 var sub = subscribe(observer);
@@ -150,73 +130,41 @@ namespace DeepBrainInterface
                     _cts.Cancel();
                     worker.Join(500);
                     sub.Dispose();
-                    if (_hRing.IsAllocated) _hRing.Free();
                 });
             });
         }
 
-        // ----- Writer thread: U16/F32 -> decimate -> rolling z-score -> ring (+ clock) -----
-        private void WriteBlock(Mat data, ulong[] clock)
+        // ----- Writer: runs on the acquisition thread -----
+        // Copies the incoming windowed Mat into the next ring slot.
+        // If the ring is full (background thread is stalled) the oldest slot is overwritten.
+        private void Enqueue(Mat mat, ulong clock, bool gate)
         {
-            if (data.Rows < _channels)
-                throw new InvalidOperationException(
-                    $"Input has {data.Rows} rows but Channels={_channels}. Feed [Channels x N] channel-major.");
-
-            int channels = _channels;
-            int baseWin = _baselineWindow;
-            int decim = DecimationFactor < 1 ? 1 : DecimationFactor;
-            float zScale = ZScoreOutputScale;
-            bool isU16 = data.Depth == Depth.U16;
-            int elemSize = isU16 ? sizeof(ushort) : sizeof(float);
-            int nCols = data.Cols;
-            int step = data.Step;
-
-            bool hasClock = clock != null;
-            int clockLen = hasClock ? clock.Length : 0;
+            int slot = _writeHead & (RingSlots - 1);
+            float[] dst = _windowRing[slot];
 
             unsafe
             {
-                byte* dbase = (byte*)data.Data.ToPointer();
-                float* ring = (float*)_hRing.AddrOfPinnedObject().ToPointer();
+                // Input is [Channels x TimePoints] channel-major (same as RippleDetectorGPU).
+                // Model expects time-major [1, TimePoints, Channels]: transpose on the fly.
+                byte* src  = (byte*)mat.Data.ToPointer();
+                int   step = mat.Step;
+                int   C    = Channels, T = TimePoints;
 
-                for (int t = 0; t < nCols; t++)
-                {
-                    if (++_decimationCounter < decim) continue;
-                    _decimationCounter = 0;
-
-                    int n_t = _zSamplesSeen < 1 ? 1 : _zSamplesSeen;
-                    int ringOff = _writeHead * channels;
-
-                    for (int c = 0; c < channels; c++)
+                fixed (float* pDst = dst)
+                    for (int c = 0; c < C; c++)
                     {
-                        byte* p = dbase + c * step + t * elemSize;
-                        float newValue = isU16 ? *(ushort*)p : *(float*)p;
-                        int histOff = c * baseWin + _zWriteIndex;
-
-                        float oldValue = (_zSamplesSeen < baseWin) ? 0f : _zHistory[histOff];
-                        _zSum[c]   += newValue - oldValue;
-                        _zSumSq[c] += (double)newValue * newValue - (double)oldValue * oldValue;
-                        _zHistory[histOff] = newValue;
-
-                        double mu = _zSum[c] / n_t;
-                        double variance = Math.Max(0.0, _zSumSq[c] / n_t - mu * mu);
-                        double sigma = Math.Max(1e-10, Math.Sqrt(variance));
-                        ring[ringOff + c] = (float)(((newValue - mu) / sigma) * zScale);
+                        float* row = (float*)(src + c * step);
+                        for (int t = 0; t < T; t++)
+                            pDst[t * C + c] = row[t];
                     }
-
-                    _clockRing[_writeHead] = (hasClock && t < clockLen) ? clock[t] : (ulong)_sampleIndex;
-                    _sampleIndex++;
-
-                    _zWriteIndex = (_zWriteIndex + 1) % baseWin;
-                    if (_zSamplesSeen < baseWin) _zSamplesSeen++;
-
-                    _writeHead = (_writeHead + 1) & (RingSize - 1);  // volatile write publishes ring + clock
-                    _written++;
-                }
             }
+
+            _clockRing[slot] = clock;
+            _gateRing[slot]  = gate;
+            _writeHead++;   // volatile int: increment publishes the slot
         }
 
-        // ----- Background thread: freshest-window inference + FSM (skipped during refractory) -----
+        // ----- Background thread: spin-poll ring -> ONNX -> FSM -----
         private unsafe void RunInference(IObserver<RippleOut> observer, CancellationToken token)
         {
             try { uint cc = 0; _controlfp_s(ref cc, _DN_FLUSH, _MCW_DN); } catch { }
@@ -230,18 +178,15 @@ namespace DeepBrainInterface
             if (TargetCore >= 0 && TargetCore < 64)
                 SetThreadAffinityMask(GetCurrentThread(), (IntPtr)(1L << TargetCore));
 
-            int windowFloats = _timePoints * _channels;
-            int strideSamples = InferenceStride < 1 ? 1 : InferenceStride;
+            int windowSize = TimePoints * Channels;
 
             var opts = new SessionOptions
             {
-                IntraOpNumThreads = 1,
-                InterOpNumThreads = 1,
+                IntraOpNumThreads = 1, InterOpNumThreads = 1,
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                EnableCpuMemArena = true,
-                EnableMemoryPattern = true
+                EnableCpuMemArena = true, EnableMemoryPattern = true
             };
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
             opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
@@ -252,70 +197,55 @@ namespace DeepBrainInterface
             var runOpts = new RunOptions();
             opts.Dispose();
 
-            float[] inBuf = new float[windowFloats];
+            float[] inBuf = new float[windowSize];
             var hIn = GCHandle.Alloc(inBuf, GCHandleType.Pinned);
             float[] outBuf = new float[1];
             var hOut = GCHandle.Alloc(outBuf, GCHandleType.Pinned);
             var mem = OrtMemoryInfo.DefaultInstance;
-            var valIn = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inBuf), new long[] { 1, _timePoints, _channels });
+            var valIn  = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inBuf),  new long[] { 1, TimePoints, Channels });
             var valOut = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(outBuf), new long[] { 1, 1 });
-            binding.BindInput(session.InputMetadata.Keys.First(), valIn);
+            binding.BindInput (session.InputMetadata.Keys.First(),  valIn);
             binding.BindOutput(session.OutputMetadata.Keys.First(), valOut);
             for (int i = 0; i < 50; i++) session.RunWithBinding(runOpts, binding);
 
-            float* ring = (float*)_hRing.AddrOfPinnedObject().ToPointer();
-            float* dst = (float*)hIn.AddrOfPinnedObject().ToPointer();
             var spinner = new SpinWait();
-            int lastInferHead = 0;
-            int skipped = 0;
 
             try
             {
                 while (!token.IsCancellationRequested)
                 {
-                    if (Volatile.Read(ref _written) < _timePoints)
+                    // Wait for a new window.
+                    if (_readHead == _writeHead)
                     {
                         if (BusySpin) Thread.SpinWait(64); else spinner.SpinOnce();
                         continue;
                     }
 
-                    int head = _writeHead;
-                    int newSamples = (head - lastInferHead) & (RingSize - 1);
-                    if (newSamples < strideSamples)
-                    {
-                        if (BusySpin) Thread.SpinWait(64); else spinner.SpinOnce();
-                        continue;
-                    }
+                    int   slot  = _readHead & (RingSlots - 1);
+                    ulong clock = _clockRing[slot];
+                    bool  gate  = _gateRing[slot];
+                    _readHead++;
 
-                    if (_ttlHolding)
-                    {
-                        // Refractory: advance the hold timer and keep emitting the held TTL. No ONNX.
-                        RunFSM(0f);
-                    }
-                    else
-                    {
-                        if (newSamples > strideSamples * 2) skipped += (newSamples / strideSamples) - 1;
+                    float prob = 0f;
 
-                        // Copy the freshest window [head - TimePoints, head), wrap-safe.
-                        int start = (head - _timePoints) & (RingSize - 1);
-                        int firstSamples = Math.Min(_timePoints, RingSize - start);
-                        Buffer.MemoryCopy(ring + start * _channels, dst,
-                            windowFloats * sizeof(float), firstSamples * _channels * sizeof(float));
-                        if (firstSamples < _timePoints)
-                        {
-                            int remFloats = (_timePoints - firstSamples) * _channels;
-                            Buffer.MemoryCopy(ring, dst + firstSamples * _channels,
-                                remFloats * sizeof(float), remFloats * sizeof(float));
-                        }
+                    // Skip ONNX during TTL refractory — pass prob=0 so the FSM advances its hold timer.
+                    // _lastTTL=true means either we just fired or we're still in the hold window.
+                    if (!_lastTTL)
+                    {
+                        fixed (float* pSrc = _windowRing[slot], pDst = inBuf)
+                            Buffer.MemoryCopy(pSrc, pDst, windowSize * sizeof(float), windowSize * sizeof(float));
 
                         session.RunWithBinding(runOpts, binding);
-                        RunFSM(outBuf[0]);
+                        prob = outBuf[0];
                     }
 
-                    _currentOutput.StrideUsed = skipped;
-                    _currentOutput.Clock = _clockRing[(head - 1) & (RingSize - 1)];
-                    observer.OnNext(_currentOutput);
-                    lastInferHead = head;
+                    // Identical call to the standalone FSM node in the current workflow.
+                    RippleOut result  = FSM.Update(prob, 0f, gate, null);
+                    result.Clock      = clock;
+                    result.Skipped    = _lastTTL ? 1 : 0;  // 1 = ONNX was skipped (refractory); 0 = ran normally
+
+                    _lastTTL = result.TTL;
+                    observer.OnNext(result);
                 }
             }
             finally
@@ -327,88 +257,6 @@ namespace DeepBrainInterface
             }
         }
 
-        private void RunFSM(float probability)
-        {
-            long now = Clock.ElapsedMilliseconds;
-
-            if (_ttlHolding)
-            {
-                if (now >= _ttlHoldUntilMs)
-                {
-                    _ttlHolding = false;
-                    _fsmState = RippleState.NoRipple;
-                    _scoreTicks = 0; _ticksDipping = 0;
-                }
-                else { UpdateOutput(probability, true); return; }
-            }
-
-            switch (_fsmState)
-            {
-                case RippleState.NoRipple:
-                    if (probability >= Threshold1_IgnoreBelow)
-                    {
-                        _fsmState = RippleState.Possible;
-                        _scoreTicks = 0; _ticksDipping = 0;
-                    }
-                    break;
-
-                case RippleState.Possible:
-                    if (probability >= Threshold1_IgnoreBelow)
-                    {
-                        _ticksDipping = 0;
-                        if (probability >= Threshold3_StrongEvidence) _scoreTicks += 2.0f;
-                        else if (probability >= Threshold2_WeakEvidence) _scoreTicks += 1.0f;
-
-                        if (_scoreTicks >= TargetEvidenceScore)
-                        {
-                            _fsmState = RippleState.Ripple;
-                            _eventCount++;
-                            _scoreTicks = 0; _ticksDipping = 0;
-                            _ttlHolding = true;
-                            _ttlHoldUntilMs = now + Math.Max(1, PostRippleRefractoryMs);
-                            UpdateOutput(probability, true);
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        _ticksDipping++;
-                        if (_ticksDipping > FramesToWaitBeforeDecay)
-                        {
-                            _scoreTicks -= ScoreDecayPerFrame;
-                            if (_scoreTicks <= 0)
-                            {
-                                _fsmState = RippleState.NoRipple;
-                                _scoreTicks = 0; _ticksDipping = 0;
-                            }
-                        }
-                    }
-                    break;
-
-                case RippleState.Ripple:
-                    if (probability < Threshold1_IgnoreBelow)
-                    {
-                        _fsmState = RippleState.NoRipple;
-                        _scoreTicks = 0; _ticksDipping = 0;
-                    }
-                    break;
-            }
-
-            UpdateOutput(probability, false);
-        }
-
-        private void UpdateOutput(float prob, bool ttl)
-        {
-            _currentOutput.Probability = prob;
-            _currentOutput.TTL = ttl;
-            _currentOutput.State = _fsmState;
-            _currentOutput.Score = _scoreTicks;
-            _currentOutput.EventCount = _eventCount;
-        }
-
-        public void Dispose()
-        {
-            _cts?.Cancel();
-        }
+        public void Dispose() => _cts?.Cancel();
     }
 }

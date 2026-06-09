@@ -11,15 +11,26 @@ namespace DeepBrainInterface
 
     public struct RippleOut
     {
+        // --- Detection state ---
         public RippleState State { get; set; }
-        public bool TTL { get; set; }
-        public float Score { get; set; }
-        public int EventCount { get; set; }
-        public float Probability { get; set; }
-        //public Mat SignalData { get; set; }
-        public float ArtifactProbability { get; set; }
-        public int StrideUsed { get; set; }
-        public ulong Clock { get; set; }  // hardware clock (uint64) of the freshest sample in the detecting window
+        public bool   TTL          { get; set; }
+        public float  Score        { get; set; }
+        public int    EventCount   { get; set; }
+        public float  Probability  { get; set; }
+        public float  ArtifactProbability { get; set; }
+
+        // --- Timing ---
+        public ulong  Clock   { get; set; }  // hardware ulong clock of the freshest sample
+        public int    Skipped { get; set; }  // 0 = inference ran normally; 1 = skipped (e.g. during refractory)
+
+        // --- FSM config snapshot (populated by RippleStateMachineMatBool.Update / SuperNode) ---
+        // Logged alongside detections so CSV captures the active settings at each event.
+        public float  Threshold1   { get; set; }  // IgnoreBelow
+        public float  Threshold2   { get; set; }  // WeakEvidence
+        public float  Threshold3   { get; set; }  // StrongEvidence
+        public float  EvidenceTarget { get; set; }
+        public int    PostRippleMs { get; set; }
+        public int    TriggerDelayMs { get; set; }
     }
 
     [Combinator]
@@ -226,14 +237,20 @@ namespace DeepBrainInterface
         {
             return new RippleOut
             {
-                State = _state,
-                Score = currentScore,
-                Probability = signal,
+                State               = _state,
+                Score               = currentScore,
+                Probability         = signal,
                 ArtifactProbability = artProb,
-                EventCount = _eventCount,
-                TTL = ttl,
-                //SignalData = data,
-                StrideUsed = 0
+                EventCount          = _eventCount,
+                TTL                 = ttl,
+                Skipped             = 0,   // standalone FSM never skips inference
+                // Config snapshot — lets a single CSV Selector capture active settings at each event
+                Threshold1          = Threshold1_IgnoreBelow,
+                Threshold2          = Threshold2_WeakEvidence,
+                Threshold3          = Threshold3_StrongEvidence,
+                EvidenceTarget      = TargetEvidenceScore,
+                PostRippleMs        = PostRippleMs,
+                TriggerDelayMs      = TriggerDelayMs,
             };
         }
 
@@ -248,6 +265,24 @@ namespace DeepBrainInterface
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
             => source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null));
+
+        // With clock — Zip(RippleDetectorCPU_output, clock) or Tuple<prob, clock> directly.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source)
+            => source.Select(t =>
+            {
+                var result = Update(GetVal(t.Item1), 0f, true, null);
+                result.Clock = t.Item2;
+                return result;
+            });
+
+        // With clock + BNO gate.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source)
+            => source.Select(t =>
+            {
+                var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
+                result.Clock = t.Item1.Item2;
+                return result;
+            });
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
