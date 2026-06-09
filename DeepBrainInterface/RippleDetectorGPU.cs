@@ -90,6 +90,7 @@ namespace DeepBrainInterface
 
             // 2. Tighten the OS scheduler tick.
             TimeBeginPeriod(1);
+            GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 
             // 3. Deterministic, single-threaded, fully-optimized CPU session.
             var opts = new SessionOptions
@@ -219,7 +220,7 @@ namespace DeepBrainInterface
 
                     return new InferenceResult
                     {
-                        Data = _outMat.Clone(),
+                        Data = targetMat,
                         LatencyMs = _timer.Elapsed.TotalMilliseconds
                     };
                 }
@@ -235,6 +236,7 @@ namespace DeepBrainInterface
                 _valOut?.Dispose();
                 _binding?.Dispose();
                 _runOpts?.Dispose();
+                _binding?.Dispose();
                 _session?.Dispose();
 
                 if (_hIn.IsAllocated) _hIn.Free();
