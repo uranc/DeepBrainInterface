@@ -266,7 +266,7 @@ namespace DeepBrainInterface
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
             => source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null));
 
-        // With clock — Zip(RippleDetectorCPU_output, clock) or Tuple<prob, clock> directly.
+        // With clock (scalar) — Zip(RippleDetectorCPU_output, clock) or Tuple<prob, clock> directly.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source)
             => source.Select(t =>
             {
@@ -275,12 +275,31 @@ namespace DeepBrainInterface
                 return result;
             });
 
-        // With clock + BNO gate.
+        // With clock array — Rhd2164.Clock is ulong[] of length TimePoints.
+        // Extract the most recent (last) clock value.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong[]>> source)
+            => source.Select(t =>
+            {
+                var result = Update(GetVal(t.Item1), 0f, true, null);
+                result.Clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
+                return result;
+            });
+
+        // With clock (scalar) + BNO gate.
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source)
             => source.Select(t =>
             {
                 var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
                 result.Clock = t.Item1.Item2;
+                return result;
+            });
+
+        // With clock array + BNO gate.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong[]>, bool>> source)
+            => source.Select(t =>
+            {
+                var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
+                result.Clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL;
                 return result;
             });
 

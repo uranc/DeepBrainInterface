@@ -96,12 +96,31 @@ namespace DeepBrainInterface
             Run(observer => source.Subscribe(t => Enqueue(t.Item1, 0UL, t.Item2), observer.OnError));
 
         // With hardware clock (Zip data with Rhd2164.Clock) — no gate.
+        // Scalar ulong: single clock per window.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source) =>
             Run(observer => source.Subscribe(t => Enqueue(t.Item1, t.Item2, true), observer.OnError));
 
+        // With clock array (Rhd2164.Clock is ulong[]) — no gate.
+        // Extract the most recent (last) clock from the array.
+        public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong[]>> source) =>
+            Run(observer => source.Subscribe(t =>
+            {
+                ulong clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
+                Enqueue(t.Item1, clock, true);
+            }, observer.OnError));
+
         // Full: Zip(data, clock) -> WithLatestFrom(BNO gate).
+        // Scalar ulong.
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source) =>
             Run(observer => source.Subscribe(t => Enqueue(t.Item1.Item1, t.Item1.Item2, t.Item2), observer.OnError));
+
+        // Full with clock array: Zip(data, clock[]) -> WithLatestFrom(gate).
+        public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong[]>, bool>> source) =>
+            Run(observer => source.Subscribe(t =>
+            {
+                ulong clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL;
+                Enqueue(t.Item1.Item1, clock, t.Item2);
+            }, observer.OnError));
 
         private IObservable<RippleOut> Run(Func<IObserver<RippleOut>, IDisposable> subscribe)
         {
