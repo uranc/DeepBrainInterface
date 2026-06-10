@@ -57,12 +57,15 @@ namespace DeepBrainInterface
         [Category("3. Hardware")]
         public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.RealTime;
 
-        // Shared state between acquisition thread (writer) and inference thread (reader).
-        // Semaphore collapses rapid arrivals: only signals when not already pending.
-        private volatile Mat  _latestMat;
-        private          ulong _latestClock;   // guarded by semaphore memory barrier
-        private volatile bool  _gateOpen = true;
-        private SemaphoreSlim  _signal;
+        // Writer (acquisition thread) stores the latest frame and bumps a counter.
+        // Reader (inference thread) checks the counter — if it moved, process the latest Mat and
+        // record where it left off. Frames that arrive during inference are silently overwritten;
+        // the reader always picks up the newest one. Skipped = counter delta - 1.
+        private volatile Mat _latestMat;
+        private ulong        _latestClock;          // written before Release(), read after Wait()
+        private volatile bool _gateOpen = true;
+        private int          _frameCounter;         // Interlocked — incremented by writer
+        private SemaphoreSlim _signal;
         private CancellationTokenSource _cts;
         private readonly RippleStateMachineMatBool _detector = new RippleStateMachineMatBool();
         private bool _lastTTL;
@@ -72,7 +75,8 @@ namespace DeepBrainInterface
             _latestMat   = mat;
             _latestClock = clock;
             _gateOpen    = gate;
-            if (_signal.CurrentCount == 0) _signal.Release();
+            Interlocked.Increment(ref _frameCounter);   // publish new frame count
+            if (_signal.CurrentCount == 0) _signal.Release(); // wake reader if idle
         }
 
         // --- Process overloads ---
@@ -113,10 +117,11 @@ namespace DeepBrainInterface
             {
                 _latestMat   = null;
                 _latestClock = 0;
-                _gateOpen    = true;
-                _lastTTL     = false;
-                _signal      = new SemaphoreSlim(0, 1);
-                _cts         = new CancellationTokenSource();
+                _gateOpen      = true;
+                _lastTTL       = false;
+                _frameCounter  = 0;
+                _signal        = new SemaphoreSlim(0, 1);
+                _cts           = new CancellationTokenSource();
 
                 var upstreamSub = subscribe(subject);
 
@@ -193,12 +198,21 @@ namespace DeepBrainInterface
                 binding.BindOutput(session.OutputMetadata.Keys.First(), valOut);
                 for (int i = 0; i < 50; i++) session.RunWithBinding(runOpts, binding);
 
+                int lastFrame = 0;
+
                 while (!token.IsCancellationRequested)
                 {
-                    // Block until a new Mat is signalled — zero CPU while idle.
+                    // Block until writer signals a new frame — zero CPU while idle.
                     _signal.Wait(token);
 
-                    // Always read the LATEST pointer — stale frames during hiccups are discarded.
+                    // Read the current counter. If it hasn't moved (spurious wake), skip.
+                    int currentFrame = Volatile.Read(ref _frameCounter);
+                    if (currentFrame == lastFrame) continue;
+
+                    int skippedFrames = currentFrame - lastFrame - 1; // frames overwritten during last inference
+                    lastFrame = currentFrame;
+
+                    // Always grab the LATEST pointer — frames that arrived during inference are discarded.
                     Mat mat = _latestMat;
                     if (mat == null) continue;
 
@@ -237,7 +251,7 @@ namespace DeepBrainInterface
 
                     RippleOut result = _detector.Update(prob, 0f, gate, null);
                     result.Clock   = clock;
-                    result.Skipped = _lastTTL ? 1 : 0;
+                    result.Skipped = skippedFrames + (_lastTTL ? 1 : 0); // dropped during hiccup + refractory skips
                     _lastTTL = result.TTL;
 
                     subject.OnNext(result);
