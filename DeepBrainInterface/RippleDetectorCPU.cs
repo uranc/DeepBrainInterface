@@ -224,6 +224,7 @@ namespace DeepBrainInterface
 
         // Clock pass-through: Zip(Buffer(44,3), Rhd2164.Clock) -> RippleDetectorCPU
         // -> Tuple<probability Mat, ulong clock> for downstream RippleStateMachineMatBool or SuperNode.
+        // Scalar ulong: single clock per window.
         public IObservable<Tuple<Mat, ulong>> Process(IObservable<Tuple<Mat, ulong>> source)
         {
             return source.Select(t =>
@@ -233,6 +234,22 @@ namespace DeepBrainInterface
                     _inputCache.Clear();
                     _inputCache.Add(t.Item1);
                     return Tuple.Create(RunInference(_inputCache), t.Item2);
+                }
+            });
+        }
+
+        // Clock array pass-through: Rhd2164.Clock is ulong[] of length TimePoints.
+        // Extract the most recent (last) clock value.
+        public IObservable<Tuple<Mat, ulong>> Process(IObservable<Tuple<Mat, ulong[]>> source)
+        {
+            return source.Select(t =>
+            {
+                lock (_inferenceLock)
+                {
+                    _inputCache.Clear();
+                    _inputCache.Add(t.Item1);
+                    ulong clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
+                    return Tuple.Create(RunInference(_inputCache), clock);
                 }
             });
         }
