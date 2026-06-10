@@ -8,6 +8,7 @@ using System.Linq;
 using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Threading;
 
 namespace DeepBrainInterface
@@ -85,7 +86,7 @@ namespace DeepBrainInterface
 
         // Latest windowed Mat + clock. Acquisition thread writes, background thread reads.
         private volatile Mat _currentMat;
-        private volatile ulong _currentClock;
+        private ulong _currentClock;   // written before semaphore Release(), read after Wait() — barrier provided by semaphore
         private volatile bool _gateOpen = true;
         // Semaphore signals the background thread that a new Mat is ready.
         // Max count = 1: if inference is slower than acquisition, extra signals collapse into one.
@@ -96,9 +97,9 @@ namespace DeepBrainInterface
 
         private void Enqueue(Mat mat, ulong clock, bool gate)
         {
-            _currentMat   = mat;
+            _currentMat = mat;
             _currentClock = clock;
-            _gateOpen     = gate;
+            _gateOpen = gate;
             // Only signal if not already pending — collapses rapid arrivals into one wake-up.
             // Background thread will read _currentMat which is always the latest.
             if (_signal.CurrentCount == 0) _signal.Release();
@@ -178,11 +179,13 @@ namespace DeepBrainInterface
 
             var opts = new SessionOptions
             {
-                IntraOpNumThreads = 1, InterOpNumThreads = 1,
+                IntraOpNumThreads = 1,
+                InterOpNumThreads = 1,
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                EnableCpuMemArena = true, EnableMemoryPattern = true
+                EnableCpuMemArena = true,
+                EnableMemoryPattern = true
             };
             opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
             opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
@@ -198,9 +201,9 @@ namespace DeepBrainInterface
             float[] outBuf = new float[1];
             var hOut = GCHandle.Alloc(outBuf, GCHandleType.Pinned);
             var mem = OrtMemoryInfo.DefaultInstance;
-            var valIn  = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inBuf),  new long[] { 1, TimePoints, Channels });
+            var valIn = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(inBuf), new long[] { 1, TimePoints, Channels });
             var valOut = OrtValue.CreateTensorValueFromMemory(mem, new Memory<float>(outBuf), new long[] { 1, 1 });
-            binding.BindInput (session.InputMetadata.Keys.First(),  valIn);
+            binding.BindInput(session.InputMetadata.Keys.First(), valIn);
             binding.BindOutput(session.OutputMetadata.Keys.First(), valOut);
             for (int i = 0; i < 50; i++) session.RunWithBinding(runOpts, binding);
 

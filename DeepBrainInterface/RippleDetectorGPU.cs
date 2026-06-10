@@ -90,7 +90,6 @@ namespace DeepBrainInterface
 
             // 2. Tighten the OS scheduler tick.
             TimeBeginPeriod(1);
-            GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 
             // 3. Deterministic, single-threaded, fully-optimized CPU session.
             var opts = new SessionOptions
@@ -146,7 +145,7 @@ namespace DeepBrainInterface
             _outMat = new Mat(BatchSize, _outCols, Depth.F32, 1, _hOut.AddrOfPinnedObject());
 
             // 6. Deep warmup: JIT kernels + populate the arena before real-time data flows.
-            for (int i = 0; i < 50; i++) _session.RunWithBinding(_runOpts, _binding);
+            for (int i = 0; i < 5; i++) _session.RunWithBinding(_runOpts, _binding);
 
             // 7. Real-time scheduling. The process priority must reach the real-time band (>=16) to
             //    avoid the 100ms+ descheduling stalls seen under Normal/High priority. Doing it here
@@ -154,7 +153,7 @@ namespace DeepBrainInterface
             //    below keeps the other cores free so the OS stays responsive under RealTime.
             try
             {
-                using (var proc = Process.GetCurrentProcess())
+                using (var proc = System.Diagnostics.Process.GetCurrentProcess())
                     proc.PriorityClass = ProcessPriority;
             }
             catch { }
@@ -220,7 +219,7 @@ namespace DeepBrainInterface
 
                     return new InferenceResult
                     {
-                        Data = targetMat,
+                        Data = _outMat,
                         LatencyMs = _timer.Elapsed.TotalMilliseconds
                     };
                 }
@@ -236,7 +235,6 @@ namespace DeepBrainInterface
                 _valOut?.Dispose();
                 _binding?.Dispose();
                 _runOpts?.Dispose();
-                _binding?.Dispose();
                 _session?.Dispose();
 
                 if (_hIn.IsAllocated) _hIn.Free();

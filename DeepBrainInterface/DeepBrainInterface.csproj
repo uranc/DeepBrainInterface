@@ -3,18 +3,16 @@
 	<PropertyGroup>
 		<Title>DeepBrainInterface</Title>
 		<Description>A package for Real-Time Closed Loop Stimulation.</Description>
-		<Authors>Cem Uran, Carmen Gasco Galvez</Authors>
-		<Copyright>Copyright © 2025</Copyright>
+		<Authors>Cem Uran</Authors>
+		<Copyright>Copyright © 2026</Copyright>
 		<GeneratePackageOnBuild Condition="'$(Configuration)'=='Release'">true</GeneratePackageOnBuild>
 		<PackageProjectUrl>https://github.com/uranc/DeepBrainInterface.git</PackageProjectUrl>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageIcon>logo.png</PackageIcon>
 		<PackageTags>Bonsai Rx DeepBrainInterface</PackageTags>
-
 		<TargetFramework>net472</TargetFramework>
 		<Features>strict</Features>
-		<Version>1.1.51</Version>
-
+		<Version>1.1.60</Version>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<Platforms>x64</Platforms>
 	</PropertyGroup>
