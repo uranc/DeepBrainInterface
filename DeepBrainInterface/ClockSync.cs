@@ -27,10 +27,10 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                int decimCounter  = 0;
-                int strideCounter = 0;
+                int decimCounter  = DecimationFactor - 1; // first raw sample (col 0) triggers, matching Buffer(1, Skip=DecimationFactor)
+                int strideCounter = Stride - 1;           // emit immediately when window first fills, matching Buffer(WindowSize, Stride)
                 ulong[] window    = new ulong[WindowSize];
-                int     filled    = 0;       // how many decimated samples are in the window so far
+                int     filled    = 0;
 
                 return source.SelectMany(block =>
                 {
@@ -55,7 +55,9 @@ namespace DeepBrainInterface
                             window[WindowSize - 1] = tick;
                         }
 
-                        // 3. Emit a copy of the window every Stride decimated samples.
+                        // 3. Emit every Stride decimated samples once window is full.
+                        //    strideCounter starts at Stride-1 so first fill triggers immediate emit,
+                        //    matching the startup behaviour of dsp:Buffer(WindowSize, Stride).
                         if (filled == WindowSize)
                         {
                             strideCounter++;
