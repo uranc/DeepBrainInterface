@@ -53,6 +53,13 @@ namespace DeepBrainInterface
         [Description("Number of new samples between inference triggers (sliding window stride).")]
         public int Stride { get; set; } = 3;
 
+        [Category("0. Preprocessing")]
+        [Description("Suppress detection until this many DECIMATED samples have been processed, " +
+                     "letting the EMA z-score converge first. Prevents spurious startup triggers from " +
+                     "warmup saturation (var starts at 0 → z clips to ±clip → model sees OOD input). " +
+                     "~ZScoreWindowSize is a sensible value; the EMA still updates during warmup.")]
+        public int WarmupSamples { get; set; } = 1250;
+
         // --- 1. Model ---
         [Category("1. Model")]
         [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
@@ -91,6 +98,8 @@ namespace DeepBrainInterface
         private int      _ringFilled;  // 0..TimePoints; capped once full
         private int      _strideCount;
         private long     _decimCounter;  // full-rate sample index, mod DecimationFactor selects kept samples
+        private long     _keptCount;     // decimated samples processed; gates detection during z-score warmup
+        private bool     _emaSeeded;     // false until the first kept sample seeds the EMA mean (absorbs DC offset)
         private double   _alpha;
         private double[] _emu;
         private double[] _evar;
@@ -120,6 +129,7 @@ namespace DeepBrainInterface
             int tp   = TimePoints;
             int cols = mat.Cols;
             int decim = Math.Max(1, DecimationFactor);
+            long warmup = Math.Max(0, WarmupSamples);
             double alpha = _alpha;
             float clip   = ZScoreClip;
 
@@ -136,8 +146,10 @@ namespace DeepBrainInterface
                     // Counter is continuous across chunks, matching Bonsai Buffer's
                     // carried skip counter — z-score/window then see the 2.5 kHz stream.
                     if (_decimCounter++ % decim != 0) continue;
+                    long kept = ++_keptCount;
 
-                    int writeSlot = _ringHead;
+                    int  writeSlot = _ringHead;
+                    bool seeded    = _emaSeeded;
 
                     for (int c = 0; c < ch; c++)
                     {
@@ -157,16 +169,29 @@ namespace DeepBrainInterface
                             case Depth.S8:  val = *(sbyte*)p;         break;
                             default:        val = *(float*)p;         break;
                         }
-                        double diff  = val - _emu[c];
-                        _emu[c]     += alpha * diff;
-                        _evar[c]     = (1.0 - alpha) * (_evar[c] + alpha * diff * diff);
-                        double sig   = Math.Sqrt(_evar[c]);
-                        // Match SlidingWindowZScore: z uses updated mean
-                        double z     = (val - _emu[c]) / (sig + 1e-8);
-                        if      (z >  clip) z =  clip;
-                        else if (z < -clip) z = -clip;
-                        _ring[c * tp + writeSlot] = (float)z;
+
+                        if (seeded)
+                        {
+                            double diff  = val - _emu[c];
+                            _emu[c]     += alpha * diff;
+                            _evar[c]     = (1.0 - alpha) * (_evar[c] + alpha * diff * diff);
+                            double sig   = Math.Sqrt(_evar[c]);
+                            // Match SlidingWindowZScore: z uses updated mean
+                            double z     = (val - _emu[c]) / (sig + 1e-8);
+                            if      (z >  clip) z =  clip;
+                            else if (z < -clip) z = -clip;
+                            _ring[c * tp + writeSlot] = (float)z;
+                        }
+                        else
+                        {
+                            // First kept sample: seed mean with the value so a DC offset
+                            // (raw U16 ~32768, not removed upstream) is absorbed instantly
+                            // instead of over ~1/alpha samples of z saturating to +clip.
+                            _emu[c] = val;
+                            _ring[c * tp + writeSlot] = 0f;
+                        }
                     }
+                    if (!seeded) _emaSeeded = true;
 
                     _ringHead = (writeSlot + 1) % tp;
                     if (_ringFilled < tp) _ringFilled++;
@@ -187,7 +212,7 @@ namespace DeepBrainInterface
                                 snap[tt * ch + cc] = _ring[cc * tp + slot];
                         }
                         _latestClock = clock;
-                        _gateOpen    = gate;
+                        _gateOpen    = gate && kept >= warmup;   // force closed during z-score warmup
 
                         Volatile.Write(ref _snapSeq, _snapSeq + 1); // -> even
 
@@ -244,6 +269,8 @@ namespace DeepBrainInterface
                 _ringFilled   = 0;
                 _strideCount  = 0;
                 _decimCounter = 0;
+                _keptCount    = 0;
+                _emaSeeded    = false;
                 _snap         = new float[tp * ch];
                 _snapSeq     = 0;
                 _latestClock = 0;
