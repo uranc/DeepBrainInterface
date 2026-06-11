@@ -15,9 +15,10 @@ using System.Threading;
 namespace DeepBrainInterface
 {
     [Combinator]
-    [Description("Streaming SuperNode: EMA Z-score + sliding window + ONNX inference in one node. " +
-                 "Accepts raw F32 µV Mat chunks [C×N] — no external Buffer or ZScore nodes needed. " +
-                 "Acquisition thread maintains ring buffer; inference thread always picks up newest window.")]
+    [Description("Single-node port of the CPU ripple-detection workflow: decimation -> EMA z-score -> " +
+                 "sliding window -> ONNX inference -> leaky-bucket FSM. Functionally identical to the " +
+                 "decimate/SlidingWindowZScore/Buffer/RippleDetectorCPU/RippleStateMachineMatBool chain. " +
+                 "Inference runs on a decoupled thread, processing every window in order (FIFO).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDetectorSuperNode : IDisposable
     {
@@ -36,29 +37,17 @@ namespace DeepBrainInterface
 
         // --- 0. Preprocessing ---
         [Category("0. Preprocessing")]
-        [Description("Decimation: keep 1 of every N full-rate samples (pure subsampling, " +
-                     "matching Buffer(1, skip=N) in the reference workflow). 30 kHz / 12 = 2.5 kHz. " +
-                     "Z-score and windowing run on the DECIMATED stream.")]
+        [Description("Decimation: keep 1 of every N full-rate samples (pure subsampling, matching " +
+                     "Buffer(1, skip=N)). 30 kHz / 12 = 2.5 kHz. Z-score and windowing run on the decimated stream.")]
         public int DecimationFactor { get; set; } = 12;
 
         [Category("0. Preprocessing")]
-        [Description("EMA Z-score window size in DECIMATED samples (alpha = 2/(N+1)).")]
+        [Description("EMA Z-score window size in DECIMATED samples (alpha = 2/(N+1)). Matches SlidingWindowZScore.")]
         public int ZScoreWindowSize { get; set; } = 1250;
 
         [Category("0. Preprocessing")]
-        [Description("Symmetric clip threshold for Z-score output (±value).")]
-        public float ZScoreClip { get; set; } = 8f;
-
-        [Category("0. Preprocessing")]
-        [Description("Number of new samples between inference triggers (sliding window stride).")]
+        [Description("New decimated samples between inference windows (sliding window stride), matching Buffer(44, skip=N).")]
         public int Stride { get; set; } = 3;
-
-        [Category("0. Preprocessing")]
-        [Description("Suppress detection until this many DECIMATED samples have been processed, " +
-                     "letting the EMA z-score converge first. Prevents spurious startup triggers from " +
-                     "warmup saturation (var starts at 0 → z clips to ±clip → model sees OOD input). " +
-                     "~ZScoreWindowSize is a sensible value; the EMA still updates during warmup.")]
-        public int WarmupSamples { get; set; } = 1250;
 
         // --- 1. Model ---
         [Category("1. Model")]
@@ -82,80 +71,66 @@ namespace DeepBrainInterface
         // --- 3. Hardware ---
         [Category("3. Hardware")]
         [Description("Auto-pin the inference thread to a performance (P) core, ignoring TargetCore. " +
-                     "Recommended on hybrid CPUs (Arrow Lake etc.) where P/E cores are interleaved in the logical index.")]
+                     "Recommended on hybrid CPUs where P/E cores are interleaved in the logical index.")]
         public bool PinToPerformanceCore { get; set; } = true;
         [Category("3. Hardware")]
-        [Description("Explicit logical-core index for the inference thread when PinToPerformanceCore is false. -1 disables pinning.")]
+        [Description("Explicit logical-core index when PinToPerformanceCore is false. -1 disables pinning.")]
         public int TargetCore { get; set; } = 7;
         [Category("3. Hardware")]
         public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.RealTime;
 
         // --- Acquisition-thread-only state ---
-        // Ring buffer: _ring[c * TimePoints + slot] = channel c at circular slot.
-        // _ringHead is the next write slot (oldest data lives there after wrap).
-        private float[]  _ring;
-        private int      _ringHead;
-        private int      _ringFilled;  // 0..TimePoints; capped once full
-        private int      _strideCount;
-        private long     _decimCounter;  // full-rate sample index, mod DecimationFactor selects kept samples
-        private long     _keptCount;     // decimated samples processed; gates detection during z-score warmup
-        private bool     _emaSeeded;     // false until the first kept sample seeds the EMA mean (absorbs DC offset)
         private double   _alpha;
         private double[] _emu;
         private double[] _evar;
+        private float[]  _ring;          // [ch * tp] channel-major ring of decimated z-scored samples
+        private int      _ringHead;
+        private int      _ringFilled;    // 0..tp
+        private int      _strideCount;
+        private long     _decimCounter;  // full-rate sample index; mod DecimationFactor selects kept samples
 
-        // Single reusable [T*C] snapshot buffer guarded by a seqlock.
-        // The writer bumps _snapSeq to odd before touching the buffer and back
-        // to even when done; a reader that sees an odd count, or a count that
-        // changed across its copy, retries. This is allocation-free AND immune
-        // to the writer lapping the reader during a multi-ms stall (newest-wins:
-        // a retry just grabs even fresher data).
-        private float[] _snap;     // [T, C] order, ready to feed ONNX
-        private int     _snapSeq;  // even = stable, odd = write in progress
+        // --- SPSC FIFO of completed windows (producer: acquisition; consumer: inference) ---
+        // Every window the producer enqueues is processed by the consumer in order, so the
+        // prediction count matches the reference workflow exactly. A window is only dropped if
+        // the consumer falls Capacity windows behind (genuine sustained overload), counted in _droppedTotal.
+        private const int Capacity = 4096;
+        private float[]  _queue;         // [Capacity * tp * ch], each slot time-major [T, C] ready for ONNX
+        private ulong[]  _queueClock;    // [Capacity]
+        private bool[]   _queueGate;     // [Capacity]
+        private long     _writeIdx;      // producer writes (Volatile), consumer reads
+        private long     _readIdx;       // consumer writes (Volatile), producer reads
 
-        // Shared (written by acq, read by inference via volatile / Interlocked)
-        private ulong         _latestClock;
-        private volatile bool _gateOpen = true;
-        private int           _frameCounter;
         private SemaphoreSlim _signal;
         private CancellationTokenSource _cts;
         private RippleStateMachineMatBool _detector;
-        private bool _lastTTL;
 
-        // Called on the acquisition thread for every incoming Mat chunk [C×N].
+        // Called on the acquisition thread for every incoming Mat chunk [C x N].
         private void EnqueueChunk(Mat mat, ulong clock, bool gate)
         {
-            int ch   = Channels;
-            int tp   = TimePoints;
-            int cols = mat.Cols;
+            int ch    = Channels;
+            int tp    = TimePoints;
+            int cols  = mat.Cols;
             int decim = Math.Max(1, DecimationFactor);
-            long warmup = Math.Max(0, WarmupSamples);
+            int stride = Math.Max(1, Stride);
+            int windowSize = tp * ch;
             double alpha = _alpha;
-            float clip   = ZScoreClip;
 
             unsafe
             {
-                byte* src   = (byte*)mat.Data.ToPointer();
-                int   step  = mat.Step;        // bytes per row (channel)
-                Depth depth = mat.Depth;       // input is U16 (raw RHD) in the reference wiring; may be S16/F32
+                byte* src    = (byte*)mat.Data.ToPointer();
+                int   step   = mat.Step;       // bytes per row (channel)
+                Depth depth  = mat.Depth;      // F32 in production; U16/S16/etc supported
                 int   elemSz = ElementSize(depth);
 
                 for (int t = 0; t < cols; t++)
                 {
-                    // Pure subsample: keep 1 of every `decim` full-rate samples.
-                    // Counter is continuous across chunks, matching Bonsai Buffer's
-                    // carried skip counter — z-score/window then see the 2.5 kHz stream.
+                    // Decimate: keep 1 of every `decim` samples, phase continuous across chunks.
                     if (_decimCounter++ % decim != 0) continue;
-                    long kept = ++_keptCount;
 
-                    int  writeSlot = _ringHead;
-                    bool seeded    = _emaSeeded;
+                    int writeSlot = _ringHead;
 
                     for (int c = 0; c < ch; c++)
                     {
-                        // Read the element in its native depth. Any positive affine
-                        // (U16 raw vs µV-scaled F32) is normalised away by the z-score
-                        // below, so no µV ConvertScale is needed upstream.
                         byte* p = src + c * step + t * elemSz;
                         float val;
                         switch (depth)
@@ -170,53 +145,38 @@ namespace DeepBrainInterface
                             default:        val = *(float*)p;         break;
                         }
 
-                        if (seeded)
-                        {
-                            double diff  = val - _emu[c];
-                            _emu[c]     += alpha * diff;
-                            _evar[c]     = (1.0 - alpha) * (_evar[c] + alpha * diff * diff);
-                            double sig   = Math.Sqrt(_evar[c]);
-                            // Match SlidingWindowZScore: z uses updated mean
-                            double z     = (val - _emu[c]) / (sig + 1e-8);
-                            if      (z >  clip) z =  clip;
-                            else if (z < -clip) z = -clip;
-                            _ring[c * tp + writeSlot] = (float)z;
-                        }
-                        else
-                        {
-                            // First kept sample: seed mean with the value so a DC offset
-                            // (raw U16 ~32768, not removed upstream) is absorbed instantly
-                            // instead of over ~1/alpha samples of z saturating to +clip.
-                            _emu[c] = val;
-                            _ring[c * tp + writeSlot] = 0f;
-                        }
+                        // EMA z-score, identical to SlidingWindowZScore (mu/var init 0, z uses updated mean, no clip).
+                        double diff  = val - _emu[c];
+                        _emu[c]     += alpha * diff;
+                        _evar[c]     = (1.0 - alpha) * (_evar[c] + alpha * diff * diff);
+                        double sig   = Math.Sqrt(_evar[c]);
+                        double z     = (val - _emu[c]) / (sig + 1e-8);
+                        _ring[c * tp + writeSlot] = (float)z;
                     }
-                    if (!seeded) _emaSeeded = true;
 
                     _ringHead = (writeSlot + 1) % tp;
                     if (_ringFilled < tp) _ringFilled++;
 
-                    if (++_strideCount >= Stride && _ringFilled == tp)
+                    if (++_strideCount >= stride && _ringFilled == tp)
                     {
                         _strideCount = 0;
 
-                        // Seqlock write: odd while filling, even when published.
-                        Volatile.Write(ref _snapSeq, _snapSeq + 1); // -> odd
+                        long w      = Volatile.Read(ref _writeIdx);
+                        int  qslot  = (int)(w % Capacity);
+                        int  baseIdx = qslot * windowSize;
+                        int  oldest = _ringHead; // oldest slot = next write position once ring is full
 
-                        float[] snap   = _snap;
-                        int     oldest = _ringHead; // oldest slot = next write slot
+                        // Linearise ring into [T, C] time-major window (ONNX input order).
                         for (int tt = 0; tt < tp; tt++)
                         {
-                            int slot = (oldest + tt) % tp;
+                            int rslot = (oldest + tt) % tp;
                             for (int cc = 0; cc < ch; cc++)
-                                snap[tt * ch + cc] = _ring[cc * tp + slot];
+                                _queue[baseIdx + tt * ch + cc] = _ring[cc * tp + rslot];
                         }
-                        _latestClock = clock;
-                        _gateOpen    = gate && kept >= warmup;   // force closed during z-score warmup
+                        _queueClock[qslot] = clock;
+                        _queueGate[qslot]  = gate;
 
-                        Volatile.Write(ref _snapSeq, _snapSeq + 1); // -> even
-
-                        Interlocked.Increment(ref _frameCounter);
+                        Volatile.Write(ref _writeIdx, w + 1);
                         if (_signal.CurrentCount == 0) _signal.Release();
                     }
                 }
@@ -260,26 +220,22 @@ namespace DeepBrainInterface
                 int ch = Channels;
                 int tp = TimePoints;
 
-                // Reset all acquisition-thread state
-                _alpha       = 2.0 / (ZScoreWindowSize + 1);
-                _emu         = new double[ch];
-                _evar        = new double[ch];
-                _ring        = new float[ch * tp];
+                _alpha        = 2.0 / (ZScoreWindowSize + 1);
+                _emu          = new double[ch];
+                _evar         = new double[ch];
+                _ring         = new float[ch * tp];
                 _ringHead     = 0;
                 _ringFilled   = 0;
                 _strideCount  = 0;
                 _decimCounter = 0;
-                _keptCount    = 0;
-                _emaSeeded    = false;
-                _snap         = new float[tp * ch];
-                _snapSeq     = 0;
-                _latestClock = 0;
-                _gateOpen    = true;
-                _lastTTL     = false;
-                _frameCounter = 0;
-                _detector    = new RippleStateMachineMatBool();
-                _signal      = new SemaphoreSlim(0, 1);
-                _cts         = new CancellationTokenSource();
+                _queue        = new float[Capacity * tp * ch];
+                _queueClock   = new ulong[Capacity];
+                _queueGate    = new bool[Capacity];
+                _writeIdx     = 0;
+                _readIdx      = 0;
+                _detector     = new RippleStateMachineMatBool();
+                _signal       = new SemaphoreSlim(0, 1);
+                _cts          = new CancellationTokenSource();
 
                 var upstreamSub = subscribe(subject);
 
@@ -358,62 +314,42 @@ namespace DeepBrainInterface
                 binding.BindOutput(session.OutputMetadata.Keys.First(), valOut);
                 for (int i = 0; i < 50; i++) session.RunWithBinding(runOpts, binding);
 
-                int lastFrame = 0;
-
                 while (!token.IsCancellationRequested)
                 {
                     _signal.Wait(token);
 
-                    int currentFrame = Volatile.Read(ref _frameCounter);
-                    if (currentFrame == lastFrame) continue;
-
-                    int skippedFrames = currentFrame - lastFrame - 1;
-                    lastFrame = currentFrame;
-
-                    // Seqlock read: copy the snapshot, retry if the writer touched
-                    // it mid-copy. newest-wins, so a retry just grabs fresher data.
-                    // The copy is unconditional (1.4 KB, ~µs) to keep the (window,
-                    // clock, gate) triple consistent even when the gate is closed.
-                    ulong clock;
-                    bool  gate;
-                    int   spins = 0;
-                    while (true)
+                    // Drain every enqueued window in order — one inference + one output per window.
+                    long r;
+                    while ((r = Volatile.Read(ref _readIdx)) < Volatile.Read(ref _writeIdx))
                     {
-                        int seqBefore = Volatile.Read(ref _snapSeq);
-                        if ((seqBefore & 1) == 0)            // writer not mid-write
-                        {
-                            Array.Copy(_snap, inBuf, windowSize);  // [T, C], ready for ONNX
-                            clock = _latestClock;
-                            gate  = _gateOpen;
-                            if (Volatile.Read(ref _snapSeq) == seqBefore) break;
-                        }
-                        if (++spins > 1000) { clock = _latestClock; gate = _gateOpen; break; }
-                    }
+                        int qslot = (int)(r % Capacity);
+                        Array.Copy(_queue, qslot * windowSize, inBuf, 0, windowSize);
+                        ulong clock = _queueClock[qslot];
+                        bool  gate  = _queueGate[qslot];
 
-                    float prob = 0f;
-                    if (gate && !_lastTTL)
-                    {
+                        // Inference runs on every window (gate only affects the FSM), matching RippleDetectorCPU.
                         session.RunWithBinding(runOpts, binding);
-                        prob = outBuf[0];
+                        float prob = outBuf[0];
+
+                        _detector.DetectionEnabled          = DetectionEnabled;
+                        _detector.Threshold1_IgnoreBelow    = Threshold1_IgnoreBelow;
+                        _detector.Threshold2_WeakEvidence   = Threshold2_WeakEvidence;
+                        _detector.Threshold3_StrongEvidence = Threshold3_StrongEvidence;
+                        _detector.TargetEvidenceScore       = TargetEvidenceScore;
+                        _detector.FramesToWaitBeforeDecay   = FramesToWaitBeforeDecay;
+                        _detector.ScoreDecayPerFrame        = ScoreDecayPerFrame;
+                        _detector.TriggerDelayMs            = TriggerDelayMs;
+                        _detector.RandomizeDelay            = RandomizeDelay;
+                        _detector.PostRippleMs              = PostRippleMs;
+
+                        RippleOut result = _detector.Update(prob, 0f, gate, null);
+                        result.Clock   = clock;
+                        result.Skipped = 0;
+
+                        subject.OnNext(result);
+
+                        Volatile.Write(ref _readIdx, r + 1);
                     }
-
-                    _detector.DetectionEnabled          = DetectionEnabled;
-                    _detector.Threshold1_IgnoreBelow    = Threshold1_IgnoreBelow;
-                    _detector.Threshold2_WeakEvidence   = Threshold2_WeakEvidence;
-                    _detector.Threshold3_StrongEvidence = Threshold3_StrongEvidence;
-                    _detector.TargetEvidenceScore       = TargetEvidenceScore;
-                    _detector.FramesToWaitBeforeDecay   = FramesToWaitBeforeDecay;
-                    _detector.ScoreDecayPerFrame        = ScoreDecayPerFrame;
-                    _detector.TriggerDelayMs            = TriggerDelayMs;
-                    _detector.RandomizeDelay            = RandomizeDelay;
-                    _detector.PostRippleMs              = PostRippleMs;
-
-                    RippleOut result = _detector.Update(prob, 0f, gate, null);
-                    result.Clock   = clock;
-                    result.Skipped = skippedFrames + (_lastTTL ? 1 : 0);
-                    _lastTTL = result.TTL;
-
-                    subject.OnNext(result);
                 }
             }
             catch (OperationCanceledException) { /* normal shutdown */ }
@@ -441,13 +377,8 @@ namespace DeepBrainInterface
             }
         }
 
-        // Walks the OS processor topology and returns the affinity mask of a single
-        // performance (P) core — the one with the highest EfficiencyClass (0 = most
-        // efficient/E-core, higher = higher-performance/P-core). Picks the LAST such
-        // core (highest logical index) to stay clear of core-0 OS/driver housekeeping.
-        // On hybrid parts (Arrow Lake etc.) P and E cores are interleaved in the
-        // logical index, so a hardcoded index is unreliable — this resolves a real
-        // P-core regardless of enumeration. Returns 0 if topology can't be read.
+        // Returns the affinity mask of one performance (P) core (highest EfficiencyClass).
+        // Picks the last such core to stay clear of core-0 housekeeping. 0 if unavailable.
         private static long FindPerformanceCoreMask()
         {
             uint len = 0;
@@ -467,8 +398,7 @@ namespace DeepBrainInterface
                     if (size <= 0) break;
                     if (relationship == RelationProcessorCore)
                     {
-                        // PROCESSOR_RELATIONSHIP: Flags@8, EfficiencyClass@9,
-                        // Reserved[20]@10, GroupCount@30, GroupMask[0].Mask@32 (KAFFINITY, 8B on x64)
+                        // PROCESSOR_RELATIONSHIP: EfficiencyClass@9, GroupMask[0].Mask@32 (KAFFINITY, 8B x64)
                         byte effClass = Marshal.ReadByte(buf, offset + 9);
                         long mask     = (long)Marshal.ReadIntPtr(buf, offset + 32);
                         if (effClass >= bestClass) { bestClass = effClass; bestMask = mask; }
