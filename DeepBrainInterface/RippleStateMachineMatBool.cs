@@ -13,24 +13,24 @@ namespace DeepBrainInterface
     {
         // --- Detection state ---
         public RippleState State { get; set; }
-        public bool   TTL          { get; set; }
-        public float  Score        { get; set; }
-        public int    EventCount   { get; set; }
-        public float  Probability  { get; set; }
-        public float  ArtifactProbability { get; set; }
+        public bool TTL { get; set; }
+        public float Score { get; set; }
+        public int EventCount { get; set; }
+        public float Probability { get; set; }
+        public float ArtifactProbability { get; set; }
 
         // --- Timing ---
-        public ulong  Clock   { get; set; }  // hardware ulong clock of the freshest sample
-        public int    Skipped { get; set; }  // 0 = inference ran normally; 1 = skipped (e.g. during refractory)
+        public ulong Clock { get; set; }  // hardware ulong clock of the freshest sample
+        public int Skipped { get; set; }  // 0 = inference ran normally; 1 = skipped (e.g. during refractory)
 
         // --- FSM config snapshot (populated by RippleStateMachineMatBool.Update / SuperNode) ---
         // Logged alongside detections so CSV captures the active settings at each event.
-        public float  Threshold1   { get; set; }  // IgnoreBelow
-        public float  Threshold2   { get; set; }  // WeakEvidence
-        public float  Threshold3   { get; set; }  // StrongEvidence
-        public float  EvidenceTarget { get; set; }
-        public int    PostRippleMs { get; set; }
-        public int    TriggerDelayMs { get; set; }
+        public float Threshold1 { get; set; }  // IgnoreBelow
+        public float Threshold2 { get; set; }  // WeakEvidence
+        public float Threshold3 { get; set; }  // StrongEvidence
+        public float EvidenceTarget { get; set; }
+        public int PostRippleMs { get; set; }
+        public int TriggerDelayMs { get; set; } // Reverted to int to log the actual applied delay
     }
 
     [Combinator]
@@ -64,8 +64,42 @@ namespace DeepBrainInterface
         [Description("How many points to subtract from the score per frame AFTER the wait period.")]
         public float ScoreDecayPerFrame { get; set; } = 1.0f;
 
-        [Category("4. TTL Output")] public int TriggerDelayMs { get; set; } = 0;
-        [Category("4. TTL Output")] public bool RandomizeDelay { get; set; } = false;
+        private string _triggerDelayMs = "0";
+        private int _delayMin = 0;
+        private int _delayMax = 0;
+
+        [Category("4. TTL Output")]
+        [Description("Delay in milliseconds before triggering the TTL. Enter a single number for a fixed delay (e.g., '250') or a bracketed range for a uniform random delay (e.g., '[250, 400]').")]
+        public string TriggerDelayMs
+        {
+            get => _triggerDelayMs;
+            set
+            {
+                _triggerDelayMs = value;
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    _delayMin = _delayMax = 0;
+                    return;
+                }
+
+                // Immediately parse and convert to int
+                var parts = value.Trim('[', ']').Split(',');
+                _delayMin = (int)float.Parse(parts[0]);
+                _delayMax = parts.Length > 1 ? (int)float.Parse(parts[1]) : _delayMin;
+
+                // Ensure min <= max
+                if (_delayMin > _delayMax)
+                {
+                    int temp = _delayMin;
+                    _delayMin = _delayMax;
+                    _delayMax = temp;
+                }
+
+                // Initialize the logged delay to the minimum baseline
+                _currentEventDelay = _delayMin;
+            }
+        }
+
         [Category("4. TTL Output")] public int PostRippleMs { get; set; } = 50;
 
         RippleState _state = RippleState.NoRipple;
@@ -78,6 +112,7 @@ namespace DeepBrainInterface
         long _ttlAtMs;
         bool _ttlHolding;
         long _ttlHoldUntilMs;
+        int _currentEventDelay; // Tracks the actual applied delay for the current ripple
 
         static readonly Stopwatch Clock = Stopwatch.StartNew();
         private readonly Random _random = new Random();
@@ -154,7 +189,7 @@ namespace DeepBrainInterface
                             _ticksInPossible++;
 
                             // Accumulate Evidence
-                            if (signal >= Threshold3_StrongEvidence) _scoreTicks += 2.0f;
+                            if (signal >= Threshold3_StrongEvidence) _scoreTicks += 2.5f;
                             else if (signal >= Threshold2_WeakEvidence) _scoreTicks += 1.0f;
 
                             reportingScore = _scoreTicks;
@@ -169,15 +204,16 @@ namespace DeepBrainInterface
                                 _ticksInPossible = 0;
                                 _ticksDipping = 0;
 
-                                if (TriggerDelayMs > 0)
+                                if (_delayMin > 0 || _delayMax > 0)
                                 {
                                     _ttlArmed = true;
-                                    int actualDelay = RandomizeDelay ? _random.Next(0, TriggerDelayMs + 1) : TriggerDelayMs;
-                                    _ttlAtMs = now + actualDelay;
+                                    _currentEventDelay = (_delayMin >= _delayMax) ? _delayMin : _random.Next(_delayMin, _delayMax + 1);
+                                    _ttlAtMs = now + _currentEventDelay;
                                     return Pack(signal, artProb, peakScore, false, null);
                                 }
                                 else
                                 {
+                                    _currentEventDelay = 0;
                                     _ttlHolding = true;
                                     _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
                                     triggerSnapshot = rawInput?.Clone();
@@ -237,20 +273,20 @@ namespace DeepBrainInterface
         {
             return new RippleOut
             {
-                State               = _state,
-                Score               = currentScore,
-                Probability         = signal,
+                State = _state,
+                Score = currentScore,
+                Probability = signal,
                 ArtifactProbability = artProb,
-                EventCount          = _eventCount,
-                TTL                 = ttl,
-                Skipped             = 0,   // standalone FSM never skips inference
+                EventCount = _eventCount,
+                TTL = ttl,
+                Skipped = 0,   // standalone FSM never skips inference
                 // Config snapshot — lets a single CSV Selector capture active settings at each event
-                Threshold1          = Threshold1_IgnoreBelow,
-                Threshold2          = Threshold2_WeakEvidence,
-                Threshold3          = Threshold3_StrongEvidence,
-                EvidenceTarget      = TargetEvidenceScore,
-                PostRippleMs        = PostRippleMs,
-                TriggerDelayMs      = TriggerDelayMs,
+                Threshold1 = Threshold1_IgnoreBelow,
+                Threshold2 = Threshold2_WeakEvidence,
+                Threshold3 = Threshold3_StrongEvidence,
+                EvidenceTarget = TargetEvidenceScore,
+                PostRippleMs = PostRippleMs,
+                TriggerDelayMs = _currentEventDelay, // Logs the exact INT delay applied to this specific event
             };
         }
 
