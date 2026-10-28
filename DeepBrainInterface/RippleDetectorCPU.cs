@@ -29,9 +29,23 @@ namespace DeepBrainInterface
         [Category("2. Dimensions")] public int TimePoints { get; set; } = 44;
         [Category("2. Dimensions")] public int Channels { get; set; } = 8;
 
+        [Browsable(false)] // no effect with IntraOpNumThreads = 1 (no thread pool); kept so old workflow files load
         [Category("3. Hardware")] public bool AllowSpinning { get; set; } = true;
 
+        [Category("3. Hardware")]
+        [Description("Legacy behaviour: raise the process to RealTime and the inference thread to Highest from inside this node. " +
+                     "Set false when a RealtimeConfig node manages priorities for the whole workflow.")]
+        public bool ManagePriority { get; set; } = true;
+
+        [Category("3. Hardware")]
+        [Description("Number of pre-allocated output Mats cycled through instead of allocating one per inference. " +
+                     "Downstream consumers must not hold an emitted Mat for more than this many emissions (256 = ~300 ms at 833 Hz).")]
+        public int OutputRingDepth { get; set; } = 256;
+
         private readonly object _inferenceLock = new object();
+        private Mat[] _outRing;
+        private int _outIdx;
+        private bool _hotThreadBoosted;
 
         private InferenceSession _session;
         private OrtIoBinding _binding;
@@ -60,14 +74,18 @@ namespace DeepBrainInterface
             // 1. Hardware Subnormal Float Flush 
             try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
 
-            // 2. Process Escalation
-            try
+            // 2. Process Escalation (legacy; prefer the RealtimeConfig node and ManagePriority = false).
+            //    The thread boost is applied lazily on the first inference so it lands on the data thread,
+            //    not on whichever thread subscribes.
+            if (ManagePriority)
             {
-                using (var process = System.Diagnostics.Process.GetCurrentProcess())
-                    process.PriorityClass = System.Diagnostics.ProcessPriorityClass.RealTime;
-                System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
+                try
+                {
+                    using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                        process.PriorityClass = System.Diagnostics.ProcessPriorityClass.RealTime;
+                }
+                catch { }
             }
-            catch { }
 
             // 3. Ultra-Lean CPU ORT Config
             var opts = new SessionOptions
@@ -107,6 +125,12 @@ namespace DeepBrainInterface
             _outCols = outSize / BatchSize;
             _outSizeBytes = outSize * sizeof(float);
 
+            // Output ring: allocated once, cycled per inference (no per-call Mat + finalizer churn)
+            int ringDepth = Math.Max(2, OutputRingDepth);
+            _outRing = new Mat[ringDepth];
+            for (int i = 0; i < ringDepth; i++) _outRing[i] = new Mat(BatchSize, _outCols, Depth.F32, 1);
+            _outIdx = 0;
+
             // 4. Pin memory and bind directly to OrtValues 
             _bufIn = new float[inSize];
             _hIn = GCHandle.Alloc(_bufIn, GCHandleType.Pinned);
@@ -133,6 +157,12 @@ namespace DeepBrainInterface
             lock (_inferenceLock)
             {
                 if (_session == null) InitializeSession();
+
+                if (ManagePriority && !_hotThreadBoosted)
+                {
+                    try { System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest; } catch { }
+                    _hotThreadBoosted = true;
+                }
 
                 unsafe
                 {
@@ -175,8 +205,9 @@ namespace DeepBrainInterface
 
                 _session.RunWithBinding(_runOpts, _binding);
 
-                // Export clean, downstream-safe native Mat
-                var resultMat = new Mat(BatchSize, _outCols, Depth.F32, 1);
+                // Export via the pre-allocated output ring (each emission is a distinct Mat; recycled after OutputRingDepth emissions)
+                var resultMat = _outRing[_outIdx];
+                _outIdx = (_outIdx + 1 == _outRing.Length) ? 0 : _outIdx + 1;
                 unsafe
                 {
                     Buffer.MemoryCopy(
@@ -190,36 +221,58 @@ namespace DeepBrainInterface
             }
         }
 
+        // Session creation + warm-up run at subscribe time (workflow start), not on the first data frame
+        // on the acquisition thread. The guard inside RunInference stays as a safety net.
+        private void EnsureInitialized()
+        {
+            lock (_inferenceLock)
+            {
+                if (_session == null) InitializeSession();
+            }
+        }
+
         public IObservable<Mat> Process(IObservable<Mat> source)
         {
-            return source.Select(m =>
+            return Observable.Defer(() =>
             {
-                lock (_inferenceLock)
+                EnsureInitialized();
+                return source.Select(m =>
                 {
-                    _inputCache.Clear();
-                    _inputCache.Add(m);
-                    return RunInference(_inputCache);
-                }
+                    lock (_inferenceLock)
+                    {
+                        _inputCache.Clear();
+                        _inputCache.Add(m);
+                        return RunInference(_inputCache);
+                    }
+                });
             });
         }
 
         public IObservable<Mat> Process(IObservable<Tuple<Mat, Mat>> source)
         {
-            return source.Select(t =>
+            return Observable.Defer(() =>
             {
-                lock (_inferenceLock)
+                EnsureInitialized();
+                return source.Select(t =>
                 {
-                    _inputCache.Clear();
-                    _inputCache.Add(t.Item1);
-                    _inputCache.Add(t.Item2);
-                    return RunInference(_inputCache);
-                }
+                    lock (_inferenceLock)
+                    {
+                        _inputCache.Clear();
+                        _inputCache.Add(t.Item1);
+                        _inputCache.Add(t.Item2);
+                        return RunInference(_inputCache);
+                    }
+                });
             });
         }
 
         public IObservable<Mat> Process(IObservable<IList<Mat>> source)
         {
-            return source.Select(batch => RunInference(batch));
+            return Observable.Defer(() =>
+            {
+                EnsureInitialized();
+                return source.Select(batch => RunInference(batch));
+            });
         }
 
         // Clock pass-through: Zip(Buffer(44,3), Rhd2164.Clock) -> RippleDetectorCPU
@@ -227,14 +280,18 @@ namespace DeepBrainInterface
         // Scalar ulong: single clock per window.
         public IObservable<Tuple<Mat, ulong>> Process(IObservable<Tuple<Mat, ulong>> source)
         {
-            return source.Select(t =>
+            return Observable.Defer(() =>
             {
-                lock (_inferenceLock)
+                EnsureInitialized();
+                return source.Select(t =>
                 {
-                    _inputCache.Clear();
-                    _inputCache.Add(t.Item1);
-                    return Tuple.Create(RunInference(_inputCache), t.Item2);
-                }
+                    lock (_inferenceLock)
+                    {
+                        _inputCache.Clear();
+                        _inputCache.Add(t.Item1);
+                        return Tuple.Create(RunInference(_inputCache), t.Item2);
+                    }
+                });
             });
         }
 
@@ -242,34 +299,46 @@ namespace DeepBrainInterface
         // Extract the most recent (last) clock value.
         public IObservable<Tuple<Mat, ulong>> Process(IObservable<Tuple<Mat, ulong[]>> source)
         {
-            return source.Select(t =>
+            return Observable.Defer(() =>
             {
-                lock (_inferenceLock)
+                EnsureInitialized();
+                return source.Select(t =>
                 {
-                    _inputCache.Clear();
-                    _inputCache.Add(t.Item1);
-                    ulong clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
-                    return Tuple.Create(RunInference(_inputCache), clock);
-                }
+                    lock (_inferenceLock)
+                    {
+                        _inputCache.Clear();
+                        _inputCache.Add(t.Item1);
+                        ulong clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
+                        return Tuple.Create(RunInference(_inputCache), clock);
+                    }
+                });
             });
         }
 
         private void ReleaseAllocations()
         {
+            // Release ORT objects first, then unpin the buffers they referenced
+            _binding?.Dispose();
+            _valIn?.Dispose();
+            _valOut?.Dispose();
+            _runOpts?.Dispose();
+            _session?.Dispose();
+
             if (_hIn.IsAllocated) _hIn.Free();
             if (_hOut.IsAllocated) _hOut.Free();
 
-            _valIn?.Dispose();
-            _valOut?.Dispose();
-            _binding?.Dispose();
-            _runOpts?.Dispose();
-            _session?.Dispose();
+            if (_outRing != null)
+            {
+                for (int i = 0; i < _outRing.Length; i++) _outRing[i]?.Dispose();
+                _outRing = null;
+            }
 
             _valIn = null;
             _valOut = null;
             _binding = null;
             _runOpts = null;
             _session = null;
+            _hotThreadBoosted = false;
         }
 
         public void Dispose()

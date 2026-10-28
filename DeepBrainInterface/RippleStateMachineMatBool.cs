@@ -49,7 +49,7 @@ namespace DeepBrainInterface
         public float Threshold2_WeakEvidence { get; set; } = 0.50f;
 
         [Category("1. Thresholds (0.0 to 1.0)")]
-        [Description("Threshold 3 (Strong): Awards 2 evidence points per frame.")]
+        [Description("Threshold 3 (Strong): Awards 2.5 evidence points per frame.")]
         public float Threshold3_StrongEvidence { get; set; } = 0.80f;
 
         [Category("2. Scoring")]
@@ -104,9 +104,8 @@ namespace DeepBrainInterface
 
         RippleState _state = RippleState.NoRipple;
         float _scoreTicks;
-        int _ticksInPossible;
         int _ticksDipping;
-        int _eventCount;
+        int _eventCount; // intentionally NOT reset between runs (same as before)
 
         bool _ttlArmed;
         long _ttlAtMs;
@@ -117,6 +116,22 @@ namespace DeepBrainInterface
         static readonly Stopwatch Clock = Stopwatch.StartNew();
         private readonly Random _random = new Random();
         private readonly object _fsmLock = new object();
+
+        /// <summary>Clears detection and TTL state so a workflow restart begins in NoRipple with no pending hold.</summary>
+        private void Reset()
+        {
+            lock (_fsmLock)
+            {
+                _state = RippleState.NoRipple;
+                _scoreTicks = 0;
+                _ticksDipping = 0;
+                _ttlArmed = false;
+                _ttlAtMs = 0;
+                _ttlHolding = false;
+                _ttlHoldUntilMs = 0;
+                _currentEventDelay = _delayMin;
+            }
+        }
 
         public RippleOut Update(float signal, float artProb, bool gateOpen, Mat rawInput)
         {
@@ -134,7 +149,6 @@ namespace DeepBrainInterface
                         _ttlHolding = false;
                         _state = RippleState.NoRipple;
                         _scoreTicks = 0;
-                        _ticksInPossible = 0;
                         _ticksDipping = 0;
                         reportingScore = 0f;
                     }
@@ -161,7 +175,6 @@ namespace DeepBrainInterface
                 {
                     _state = RippleState.NoRipple;
                     _scoreTicks = 0;
-                    _ticksInPossible = 0;
                     _ticksDipping = 0;
                     return Pack(signal, artProb, 0f, false, null);
                 }
@@ -174,7 +187,6 @@ namespace DeepBrainInterface
                         {
                             _state = RippleState.Possible;
                             _scoreTicks = 0;
-                            _ticksInPossible = 0;
                             _ticksDipping = 0;
                         }
                         reportingScore = 0f;
@@ -184,9 +196,8 @@ namespace DeepBrainInterface
 
                         if (signal >= Threshold1_IgnoreBelow)
                         {
-                            // We are above the floor. Reset the dip timer and count frames.
+                            // We are above the floor. Reset the dip timer.
                             _ticksDipping = 0;
-                            _ticksInPossible++;
 
                             // Accumulate Evidence
                             if (signal >= Threshold3_StrongEvidence) _scoreTicks += 2.5f;
@@ -201,7 +212,6 @@ namespace DeepBrainInterface
                                 _eventCount++;
                                 float peakScore = _scoreTicks;
                                 _scoreTicks = 0;
-                                _ticksInPossible = 0;
                                 _ticksDipping = 0;
 
                                 if (_delayMin > 0 || _delayMax > 0)
@@ -236,7 +246,6 @@ namespace DeepBrainInterface
                                     // The bucket is empty. Hard reset.
                                     _state = RippleState.NoRipple;
                                     _scoreTicks = 0;
-                                    _ticksInPossible = 0;
                                     _ticksDipping = 0;
                                     reportingScore = 0f;
                                 }
@@ -296,57 +305,79 @@ namespace DeepBrainInterface
             unsafe { return *((float*)m.Data.ToPointer()); }
         }
 
+        // Every overload resets the FSM state at subscribe (workflow start) via Observable.Defer.
+
         public IObservable<RippleOut> Process(IObservable<Mat> source)
-            => source.Select(m => Update(GetVal(m), 0f, true, null));
+            => Observable.Defer(() => { Reset(); return source.Select(m => Update(GetVal(m), 0f, true, null)); });
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
-            => source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null));
+            => Observable.Defer(() => { Reset(); return source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null)); });
 
         // With clock (scalar) — Zip(RippleDetectorCPU_output, clock) or Tuple<prob, clock> directly.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source)
-            => source.Select(t =>
+            => Observable.Defer(() =>
             {
-                var result = Update(GetVal(t.Item1), 0f, true, null);
-                result.Clock = t.Item2;
-                return result;
+                Reset();
+                return source.Select(t =>
+                {
+                    var result = Update(GetVal(t.Item1), 0f, true, null);
+                    result.Clock = t.Item2;
+                    return result;
+                });
             });
 
         // With clock array — Rhd2164.Clock is ulong[] of length TimePoints.
         // Extract the most recent (last) clock value.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong[]>> source)
-            => source.Select(t =>
+            => Observable.Defer(() =>
             {
-                var result = Update(GetVal(t.Item1), 0f, true, null);
-                result.Clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
-                return result;
+                Reset();
+                return source.Select(t =>
+                {
+                    var result = Update(GetVal(t.Item1), 0f, true, null);
+                    result.Clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
+                    return result;
+                });
             });
 
-        // With clock (scalar) + BNO gate.
+        // With clock (scalar) + BNO gate. (Also what Zip(detector, ClockSync) + WithLatestFrom(gate) now produces.)
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source)
-            => source.Select(t =>
+            => Observable.Defer(() =>
             {
-                var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
-                result.Clock = t.Item1.Item2;
-                return result;
+                Reset();
+                return source.Select(t =>
+                {
+                    var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
+                    result.Clock = t.Item1.Item2;
+                    return result;
+                });
             });
 
         // With clock array + BNO gate.
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong[]>, bool>> source)
-            => source.Select(t =>
+            => Observable.Defer(() =>
             {
-                var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
-                result.Clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL;
-                return result;
+                Reset();
+                return source.Select(t =>
+                {
+                    var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
+                    result.Clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL;
+                    return result;
+                });
             });
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
         {
-            return source.Select(t =>
+            return Observable.Defer(() =>
             {
-                float prob = GetVal(t.Item1.Item1);
-                Mat rawData = t.Item1.Item2;
-                bool gate = t.Item2;
-                return Update(prob, 0f, gate, rawData);
+                Reset();
+                return source.Select(t =>
+                {
+                    float prob = GetVal(t.Item1.Item1);
+                    Mat rawData = t.Item1.Item2;
+                    bool gate = t.Item2;
+                    return Update(prob, 0f, gate, rawData);
+                });
             });
         }
     }
