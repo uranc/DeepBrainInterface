@@ -1,14 +1,14 @@
-<?xml version="1.0" encoding="utf-8"?>
-<WorkflowBuilder Version="2.9.0"
+﻿<?xml version="1.0" encoding="utf-8"?>
+<WorkflowBuilder Version="2.9.1"
                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                  xmlns:onix1="clr-namespace:OpenEphys.Onix1;assembly=OpenEphys.Onix1"
                  xmlns:rx="clr-namespace:Bonsai.Reactive;assembly=Bonsai.Core"
                  xmlns:io="clr-namespace:Bonsai.IO;assembly=Bonsai.System"
+                 xmlns:p1="clr-namespace:OpenEphys.Sockets.Bonsai;assembly=OpenEphys.Sockets.Bonsai"
+                 xmlns:p2="clr-namespace:DeepBrainInterface;assembly=DeepBrainInterface"
                  xmlns:dsp="clr-namespace:Bonsai.Dsp;assembly=Bonsai.Dsp"
-                 xmlns:p1="clr-namespace:DeepBrainInterface;assembly=DeepBrainInterface"
-                 xmlns:p2="clr-namespace:OpenCV.Net;assembly=OpenCV.Net"
+                 xmlns:p3="clr-namespace:OpenCV.Net;assembly=OpenCV.Net"
                  xmlns:scr="clr-namespace:Bonsai.Scripting.Expressions;assembly=Bonsai.Scripting.Expressions"
-                 xmlns:p3="clr-namespace:OpenEphys.Sockets.Bonsai;assembly=OpenEphys.Sockets.Bonsai"
                  xmlns:p4="clr-namespace:Bonsai.Ephys.Design;assembly=Bonsai.Ephys.Design"
                  xmlns="https://bonsai-rx.org/2018/workflow">
   <Workflow>
@@ -90,7 +90,7 @@
           <onix1:Name>Headstage64</onix1:Name>
           <onix1:Rhd2164>
             <onix1:DeviceName>Headstage64/Rhd2164</onix1:DeviceName>
-            <onix1:DeviceAddress>512</onix1:DeviceAddress>
+            <onix1:DeviceAddress>256</onix1:DeviceAddress>
             <onix1:Enable>true</onix1:Enable>
             <onix1:DspCutoff>Off</onix1:DspCutoff>
             <onix1:AnalogLowCutoff>Low100mHz</onix1:AnalogLowCutoff>
@@ -98,17 +98,17 @@
           </onix1:Rhd2164>
           <onix1:Bno055>
             <onix1:DeviceName>Headstage64/Bno055</onix1:DeviceName>
-            <onix1:DeviceAddress>513</onix1:DeviceAddress>
+            <onix1:DeviceAddress>257</onix1:DeviceAddress>
             <onix1:Enable>true</onix1:Enable>
           </onix1:Bno055>
           <onix1:TS4231>
             <onix1:DeviceName>Headstage64/TS4231V1</onix1:DeviceName>
-            <onix1:DeviceAddress>514</onix1:DeviceAddress>
+            <onix1:DeviceAddress>258</onix1:DeviceAddress>
             <onix1:Enable>false</onix1:Enable>
           </onix1:TS4231>
           <onix1:ElectricalStimulator>
             <onix1:DeviceName>Headstage64/Headstage64ElectricalStimulator</onix1:DeviceName>
-            <onix1:DeviceAddress>515</onix1:DeviceAddress>
+            <onix1:DeviceAddress>259</onix1:DeviceAddress>
             <onix1:Arm>false</onix1:Arm>
             <onix1:TriggerDelay>0</onix1:TriggerDelay>
             <onix1:PhaseOneCurrent>200</onix1:PhaseOneCurrent>
@@ -124,8 +124,8 @@
           </onix1:ElectricalStimulator>
           <onix1:OpticalStimulator>
             <onix1:DeviceName>Headstage64/Headstage64OpticalStimulator</onix1:DeviceName>
-            <onix1:DeviceAddress>516</onix1:DeviceAddress>
-            <onix1:Arm>true</onix1:Arm>
+            <onix1:DeviceAddress>260</onix1:DeviceAddress>
+            <onix1:Arm>false</onix1:Arm>
             <onix1:Delay>0</onix1:Delay>
             <onix1:MaxCurrent>10</onix1:MaxCurrent>
             <onix1:ChannelOneCurrent>50</onix1:ChannelOneCurrent>
@@ -136,9 +136,9 @@
             <onix1:InterBurstInterval>0</onix1:InterBurstInterval>
             <onix1:BurstsPerTrain>1</onix1:BurstsPerTrain>
           </onix1:OpticalStimulator>
-          <onix1:Port>PortB</onix1:Port>
+          <onix1:Port>PortA</onix1:Port>
           <onix1:PortVoltage>
-            <onix1:Requested>8.1</onix1:Requested>
+            <onix1:Requested>8.2</onix1:Requested>
           </onix1:PortVoltage>
         </Combinator>
       </Expression>
@@ -173,6 +173,22 @@
             <Edge From="1" To="2" Label="Source1" />
           </Edges>
         </Workflow>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p1:TcpServer">
+          <p1:Name>OE</p1:Name>
+          <p1:Port>9001</p1:Port>
+          <p1:Address>localhost</p1:Address>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:RealtimeConfig">
+          <p2:ProcessPriority>High</p2:ProcessPriority>
+          <p2:TimerResolution1ms>true</p2:TimerResolution1ms>
+          <p2:GcLatencyMode>SustainedLowLatency</p2:GcLatencyMode>
+          <p2:DisablePowerThrottling>true</p2:DisablePowerThrottling>
+          <p2:RestrictToPerformanceCores>false</p2:RestrictToPerformanceCores>
+        </Combinator>
       </Expression>
       <Expression xsi:type="Combinator">
         <Combinator xsi:type="onix1:Rhd2164Data">
@@ -281,6 +297,111 @@
         </Combinator>
       </Expression>
       <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:SlidingWindowZScore">
+          <p2:WindowSize>1250</p2:WindowSize>
+          <p2:Eps>1E-08</p2:Eps>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="dsp:Buffer">
+          <dsp:Count>44</dsp:Count>
+          <dsp:Skip>3</dsp:Skip>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:RippleDetectorCPU">
+          <p2:ModelPath>D:\Data\DBI2\frozen_models\ES_model_tripletClean1450.onnx</p2:ModelPath>
+          <p2:BatchSize>1</p2:BatchSize>
+          <p2:TimePoints>44</p2:TimePoints>
+          <p2:Channels>8</p2:Channels>
+          <p2:AllowSpinning>true</p2:AllowSpinning>
+          <p2:ManagePriority>false</p2:ManagePriority>
+          <p2:OutputRingDepth>64</p2:OutputRingDepth>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="MemberSelector">
+        <Selector>Clock</Selector>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:ClockSync">
+          <p2:DecimationFactor>12</p2:DecimationFactor>
+          <p2:WindowSize>44</p2:WindowSize>
+          <p2:Stride>3</p2:Stride>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:Zip" />
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="onix1:Bno055Data">
+          <onix1:DeviceName>Headstage64/Bno055</onix1:DeviceName>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="MemberSelector">
+        <Selector>Acceleration</Selector>
+        <TypeMapping xsi:type="TypeMapping" TypeArguments="p3:Mat" />
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:BnoMovementDetector">
+          <p2:Alpha>0.01</p2:Alpha>
+          <p2:Threshold>1</p2:Threshold>
+          <p2:MedianWindow>5</p2:MedianWindow>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="MemberSelector">
+        <Selector>IsActive</Selector>
+      </Expression>
+      <Expression xsi:type="BitwiseNot" />
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:StartWithBool">
+          <p2:Value>false</p2:Value>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:WithLatestFrom" />
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="p2:RippleStateMachineMatBool">
+          <p2:DetectionEnabled>true</p2:DetectionEnabled>
+          <p2:Threshold1_IgnoreBelow>0.05</p2:Threshold1_IgnoreBelow>
+          <p2:Threshold2_WeakEvidence>0.25</p2:Threshold2_WeakEvidence>
+          <p2:Threshold3_StrongEvidence>0.25</p2:Threshold3_StrongEvidence>
+          <p2:TargetEvidenceScore>10</p2:TargetEvidenceScore>
+          <p2:FramesToWaitBeforeDecay>5</p2:FramesToWaitBeforeDecay>
+          <p2:ScoreDecayPerFrame>1.5</p2:ScoreDecayPerFrame>
+          <p2:TriggerDelayMs>0</p2:TriggerDelayMs>
+          <p2:PostRippleMs>250</p2:PostRippleMs>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="MemberSelector">
+        <Selector>TTL</Selector>
+      </Expression>
+      <Expression xsi:type="scr:ExpressionTransform">
+        <scr:Name>BoolToInt</scr:Name>
+        <scr:Expression>it ? 1:0</scr:Expression>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="onix1:DigitalOutput">
+          <onix1:DeviceName>BreakoutBoard/DigitalIO</onix1:DeviceName>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:ObserveOn">
+          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="rx:PublishSubject">
+        <Name>TTLSignal</Name>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:ObserveOn">
+          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="rx:PublishSubject">
+        <Name>EphysRaw</Name>
+      </Expression>
+      <Expression xsi:type="Combinator">
         <Combinator xsi:type="dsp:ConvertScale">
           <dsp:Depth>F32</dsp:Depth>
           <dsp:Scale>1</dsp:Scale>
@@ -294,108 +415,8 @@
           <dsp:Shift>0</dsp:Shift>
         </Combinator>
       </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:SlidingWindowZScore">
-          <p1:WindowSize>1250</p1:WindowSize>
-          <p1:Eps>1E-08</p1:Eps>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="dsp:Buffer">
-          <dsp:Count>44</dsp:Count>
-          <dsp:Skip>3</dsp:Skip>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:RippleDetectorCPU">
-          <p1:ModelPath>D:\Data\DBI2\frozen_models\ES_model_tripletClean1450.onnx</p1:ModelPath>
-          <p1:BatchSize>1</p1:BatchSize>
-          <p1:TimePoints>44</p1:TimePoints>
-          <p1:Channels>8</p1:Channels>
-          <p1:AllowSpinning>true</p1:AllowSpinning>
-          <p1:ManagePriority>false</p1:ManagePriority>
-          <p1:OutputRingDepth>256</p1:OutputRingDepth>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>Clock</Selector>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:ClockSync">
-          <p1:DecimationFactor>12</p1:DecimationFactor>
-          <p1:WindowSize>44</p1:WindowSize>
-          <p1:Stride>3</p1:Stride>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:Zip" />
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="onix1:Bno055Data">
-          <onix1:DeviceName>Headstage64/Bno055</onix1:DeviceName>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>Acceleration</Selector>
-        <TypeMapping xsi:type="TypeMapping" TypeArguments="p2:Mat" />
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:BnoMovementDetector">
-          <p1:Alpha>0.01</p1:Alpha>
-          <p1:Threshold>1</p1:Threshold>
-          <p1:MedianWindow>5</p1:MedianWindow>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>IsActive</Selector>
-      </Expression>
-      <Expression xsi:type="BitwiseNot" />
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:StartWithBool">
-          <p1:Value>false</p1:Value>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:WithLatestFrom" />
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:RippleStateMachineMatBool">
-          <p1:DetectionEnabled>true</p1:DetectionEnabled>
-          <p1:Threshold1_IgnoreBelow>0.05</p1:Threshold1_IgnoreBelow>
-          <p1:Threshold2_WeakEvidence>0.25</p1:Threshold2_WeakEvidence>
-          <p1:Threshold3_StrongEvidence>0.25</p1:Threshold3_StrongEvidence>
-          <p1:TargetEvidenceScore>10</p1:TargetEvidenceScore>
-          <p1:FramesToWaitBeforeDecay>5</p1:FramesToWaitBeforeDecay>
-          <p1:ScoreDecayPerFrame>1.5</p1:ScoreDecayPerFrame>
-          <p1:TriggerDelayMs>0</p1:TriggerDelayMs>
-          <p1:PostRippleMs>250</p1:PostRippleMs>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>EventCount</Selector>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>TTL</Selector>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:ObserveOn">
-          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="scr:ExpressionTransform">
-        <scr:Name>BoolToInt</scr:Name>
-        <scr:Expression>it ? 1:0</scr:Expression>
-      </Expression>
       <Expression xsi:type="rx:PublishSubject">
-        <Name>TTLSignal</Name>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:ObserveOn">
-          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="rx:PublishSubject">
-        <Name>EphysRaw</Name>
+        <Name>EphysScaled</Name>
       </Expression>
       <Expression xsi:type="Combinator">
         <Combinator xsi:type="rx:ObserveOn">
@@ -416,7 +437,15 @@
         </Combinator>
       </Expression>
       <Expression xsi:type="rx:PublishSubject">
-        <Name>EphysScaled</Name>
+        <Name>RippleProb</Name>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:ObserveOn">
+          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="rx:PublishSubject">
+        <Name>EphysClock</Name>
       </Expression>
       <Expression xsi:type="Combinator">
         <Combinator xsi:type="rx:ObserveOn">
@@ -431,43 +460,6 @@
         <io:Suffix>FileCount</io:Suffix>
         <io:IncludeHeader>false</io:IncludeHeader>
         <io:Selector>TTL,Score,EventCount,Probability,Threshold1,Threshold2,Threshold3,EvidenceTarget,PostRippleMs,TriggerDelayMs,Clock,Skipped,Clock</io:Selector>
-      </Expression>
-      <Expression xsi:type="MemberSelector">
-        <Selector>Score</Selector>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:ObserveOn">
-          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="rx:PublishSubject">
-        <Name>RippleProb</Name>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:ObserveOn">
-          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="rx:PublishSubject">
-        <Name>EphysClock</Name>
-      </Expression>
-      <Expression xsi:type="Disable">
-        <Builder xsi:type="scr:ExpressionTransform">
-          <scr:Name>BoolToInt</scr:Name>
-          <scr:Expression>it ? 1:0</scr:Expression>
-        </Builder>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="onix1:Headstage64GpoTrigger">
-          <onix1:DeviceName>Headstage64/Headstage64PortController</onix1:DeviceName>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Disable">
-        <Builder xsi:type="Combinator">
-          <Combinator xsi:type="onix1:DigitalOutput">
-            <onix1:DeviceName>BreakoutBoard/DigitalIO</onix1:DeviceName>
-          </Combinator>
-        </Builder>
       </Expression>
       <Expression xsi:type="GroupWorkflow">
         <Name>SaveRHD,AnalogInputs,RippleProb</Name>
@@ -581,6 +573,24 @@
                 <dsp:Layout>ColumnMajor</dsp:Layout>
               </Combinator>
             </Expression>
+            <Expression xsi:type="Combinator">
+              <Combinator xsi:type="p2:GcStats">
+                <p2:IntervalMs>100</p2:IntervalMs>
+              </Combinator>
+            </Expression>
+            <Expression xsi:type="Combinator">
+              <Combinator xsi:type="rx:ObserveOn">
+                <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
+              </Combinator>
+            </Expression>
+            <Expression xsi:type="io:CsvWriter">
+              <io:FileName>gc-stats_.csv</io:FileName>
+              <io:Append>false</io:Append>
+              <io:Overwrite>false</io:Overwrite>
+              <io:Suffix>FileCount</io:Suffix>
+              <io:IncludeHeader>true</io:IncludeHeader>
+              <io:Selector>TimeSeconds,Gen0,Gen1,Gen2,HeapBytes,PrivateBytes,WorkingSetBytes</io:Selector>
+            </Expression>
           </Nodes>
           <Edges>
             <Edge From="0" To="1" Label="Source1" />
@@ -597,6 +607,8 @@
             <Edge From="14" To="15" Label="Source1" />
             <Edge From="15" To="16" Label="Source1" />
             <Edge From="17" To="18" Label="Source1" />
+            <Edge From="19" To="20" Label="Source1" />
+            <Edge From="20" To="21" Label="Source1" />
           </Edges>
         </Workflow>
       </Expression>
@@ -701,20 +713,16 @@
                 <dsp:Skip xsi:nil="true" />
               </Combinator>
             </Expression>
-            <Expression xsi:type="Disable">
-              <Builder xsi:type="Combinator">
-                <Combinator xsi:type="p3:SendMatOverSocket">
-                  <p3:Connection>OE</p3:Connection>
-                </Combinator>
-              </Builder>
+            <Expression xsi:type="Combinator">
+              <Combinator xsi:type="p1:SendMatOverSocket">
+                <p1:Connection>OE</p1:Connection>
+              </Combinator>
             </Expression>
-            <Expression xsi:type="Disable">
-              <Builder xsi:type="Combinator">
-                <Combinator xsi:type="dsp:Buffer">
-                  <dsp:Count>250</dsp:Count>
-                  <dsp:Skip xsi:nil="true" />
-                </Combinator>
-              </Builder>
+            <Expression xsi:type="Combinator">
+              <Combinator xsi:type="dsp:Buffer">
+                <dsp:Count>250</dsp:Count>
+                <dsp:Skip xsi:nil="true" />
+              </Combinator>
             </Expression>
             <Expression xsi:type="Disable">
               <Builder xsi:type="p4:WaveformVisualizerBuilder">
@@ -750,60 +758,30 @@
           </Edges>
         </Workflow>
       </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:RealtimeConfig">
-          <p1:ProcessPriority>High</p1:ProcessPriority>
-          <p1:TimerResolution1ms>true</p1:TimerResolution1ms>
-          <p1:GcLatencyMode>SustainedLowLatency</p1:GcLatencyMode>
-          <p1:DisablePowerThrottling>true</p1:DisablePowerThrottling>
-          <p1:RestrictToPerformanceCores>false</p1:RestrictToPerformanceCores>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="p1:GcStats">
-          <p1:IntervalMs>100</p1:IntervalMs>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:ObserveOn">
-          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="io:CsvWriter">
-        <io:FileName>gc-stats_.csv</io:FileName>
-        <io:Append>false</io:Append>
-        <io:Overwrite>false</io:Overwrite>
-        <io:Suffix>FileCount</io:Suffix>
-        <io:IncludeHeader>true</io:IncludeHeader>
-        <io:Selector>TimeSeconds,Gen0,Gen1,Gen2,HeapBytes,PrivateBytes,WorkingSetBytes</io:Selector>
-      </Expression>
     </Nodes>
     <Edges>
       <Edge From="0" To="1" Label="Source1" />
       <Edge From="1" To="2" Label="Source1" />
       <Edge From="2" To="3" Label="Source1" />
       <Edge From="2" To="4" Label="Source1" />
-      <Edge From="5" To="6" Label="Source1" />
-      <Edge From="5" To="16" Label="Source1" />
-      <Edge From="6" To="7" Label="Source1" />
       <Edge From="7" To="8" Label="Source1" />
+      <Edge From="7" To="16" Label="Source1" />
       <Edge From="8" To="9" Label="Source1" />
-      <Edge From="8" To="32" Label="Source1" />
       <Edge From="9" To="10" Label="Source1" />
       <Edge From="10" To="11" Label="Source1" />
+      <Edge From="10" To="32" Label="Source1" />
       <Edge From="11" To="12" Label="Source1" />
       <Edge From="12" To="13" Label="Source1" />
-      <Edge From="12" To="36" Label="Source1" />
       <Edge From="13" To="14" Label="Source1" />
       <Edge From="14" To="15" Label="Source1" />
       <Edge From="15" To="18" Label="Source1" />
-      <Edge From="15" To="41" Label="Source1" />
+      <Edge From="15" To="39" Label="Source1" />
       <Edge From="16" To="17" Label="Source1" />
-      <Edge From="16" To="43" Label="Source1" />
+      <Edge From="16" To="41" Label="Source1" />
       <Edge From="17" To="18" Label="Source2" />
       <Edge From="18" To="25" Label="Source1" />
       <Edge From="19" To="20" Label="Source1" />
-      <Edge From="19" To="34" Label="Source1" />
+      <Edge From="19" To="37" Label="Source1" />
       <Edge From="20" To="21" Label="Source1" />
       <Edge From="21" To="22" Label="Source1" />
       <Edge From="22" To="23" Label="Source1" />
@@ -811,23 +789,19 @@
       <Edge From="24" To="25" Label="Source2" />
       <Edge From="25" To="26" Label="Source1" />
       <Edge From="26" To="27" Label="Source1" />
-      <Edge From="26" To="28" Label="Source1" />
-      <Edge From="26" To="38" Label="Source1" />
-      <Edge From="26" To="40" Label="Source1" />
-      <Edge From="28" To="45" Label="Source1" />
+      <Edge From="26" To="43" Label="Source1" />
+      <Edge From="27" To="28" Label="Source1" />
       <Edge From="28" To="29" Label="Source1" />
       <Edge From="29" To="30" Label="Source1" />
       <Edge From="30" To="31" Label="Source1" />
       <Edge From="32" To="33" Label="Source1" />
+      <Edge From="33" To="34" Label="Source1" />
       <Edge From="34" To="35" Label="Source1" />
-      <Edge From="36" To="37" Label="Source1" />
-      <Edge From="38" To="39" Label="Source1" />
+      <Edge From="35" To="36" Label="Source1" />
+      <Edge From="37" To="38" Label="Source1" />
+      <Edge From="39" To="40" Label="Source1" />
       <Edge From="41" To="42" Label="Source1" />
       <Edge From="43" To="44" Label="Source1" />
-      <Edge From="45" To="46" Label="Source1" />
-      <Edge From="46" To="47" Label="Source1" />
-      <Edge From="51" To="52" Label="Source1" />
-      <Edge From="52" To="53" Label="Source1" />
     </Edges>
   </Workflow>
 </WorkflowBuilder>
