@@ -138,7 +138,7 @@
           </onix1:OpticalStimulator>
           <onix1:Port>PortA</onix1:Port>
           <onix1:PortVoltage>
-            <onix1:Requested>8.2</onix1:Requested>
+            <onix1:Requested>8.3</onix1:Requested>
           </onix1:PortVoltage>
         </Combinator>
       </Expression>
@@ -297,6 +297,20 @@
         </Combinator>
       </Expression>
       <Expression xsi:type="Combinator">
+        <Combinator xsi:type="dsp:ConvertScale">
+          <dsp:Depth>F32</dsp:Depth>
+          <dsp:Scale>1</dsp:Scale>
+          <dsp:Shift>-32768</dsp:Shift>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="dsp:ConvertScale">
+          <dsp:Depth>F32</dsp:Depth>
+          <dsp:Scale>0.195</dsp:Scale>
+          <dsp:Shift>0</dsp:Shift>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="Combinator">
         <Combinator xsi:type="p2:SlidingWindowZScore">
           <p2:WindowSize>1250</p2:WindowSize>
           <p2:Eps>1E-08</p2:Eps>
@@ -402,23 +416,6 @@
         <Name>EphysRaw</Name>
       </Expression>
       <Expression xsi:type="Combinator">
-        <Combinator xsi:type="dsp:ConvertScale">
-          <dsp:Depth>F32</dsp:Depth>
-          <dsp:Scale>1</dsp:Scale>
-          <dsp:Shift>-32768</dsp:Shift>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="dsp:ConvertScale">
-          <dsp:Depth>F32</dsp:Depth>
-          <dsp:Scale>0.195</dsp:Scale>
-          <dsp:Shift>0</dsp:Shift>
-        </Combinator>
-      </Expression>
-      <Expression xsi:type="rx:PublishSubject">
-        <Name>EphysScaled</Name>
-      </Expression>
-      <Expression xsi:type="Combinator">
         <Combinator xsi:type="rx:ObserveOn">
           <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
         </Combinator>
@@ -460,6 +457,14 @@
         <io:Suffix>FileCount</io:Suffix>
         <io:IncludeHeader>false</io:IncludeHeader>
         <io:Selector>TTL,Score,EventCount,Probability,Threshold1,Threshold2,Threshold3,EvidenceTarget,PostRippleMs,TriggerDelayMs,Clock,Skipped,Clock</io:Selector>
+      </Expression>
+      <Expression xsi:type="Combinator">
+        <Combinator xsi:type="rx:ObserveOn">
+          <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
+        </Combinator>
+      </Expression>
+      <Expression xsi:type="rx:PublishSubject">
+        <Name>EphysScaled</Name>
       </Expression>
       <Expression xsi:type="GroupWorkflow">
         <Name>SaveRHD,AnalogInputs,RippleProb</Name>
@@ -765,43 +770,44 @@
       <Edge From="2" To="3" Label="Source1" />
       <Edge From="2" To="4" Label="Source1" />
       <Edge From="7" To="8" Label="Source1" />
-      <Edge From="7" To="16" Label="Source1" />
+      <Edge From="7" To="18" Label="Source1" />
       <Edge From="8" To="9" Label="Source1" />
       <Edge From="9" To="10" Label="Source1" />
       <Edge From="10" To="11" Label="Source1" />
-      <Edge From="10" To="32" Label="Source1" />
+      <Edge From="10" To="34" Label="Source1" />
       <Edge From="11" To="12" Label="Source1" />
       <Edge From="12" To="13" Label="Source1" />
       <Edge From="13" To="14" Label="Source1" />
       <Edge From="14" To="15" Label="Source1" />
-      <Edge From="15" To="18" Label="Source1" />
-      <Edge From="15" To="39" Label="Source1" />
+      <Edge From="14" To="44" Label="Source1" />
+      <Edge From="15" To="16" Label="Source1" />
       <Edge From="16" To="17" Label="Source1" />
-      <Edge From="16" To="41" Label="Source1" />
-      <Edge From="17" To="18" Label="Source2" />
-      <Edge From="18" To="25" Label="Source1" />
-      <Edge From="19" To="20" Label="Source1" />
-      <Edge From="19" To="37" Label="Source1" />
-      <Edge From="20" To="21" Label="Source1" />
+      <Edge From="17" To="20" Label="Source1" />
+      <Edge From="17" To="38" Label="Source1" />
+      <Edge From="18" To="19" Label="Source1" />
+      <Edge From="18" To="40" Label="Source1" />
+      <Edge From="19" To="20" Label="Source2" />
+      <Edge From="20" To="27" Label="Source1" />
       <Edge From="21" To="22" Label="Source1" />
+      <Edge From="21" To="36" Label="Source1" />
       <Edge From="22" To="23" Label="Source1" />
       <Edge From="23" To="24" Label="Source1" />
-      <Edge From="24" To="25" Label="Source2" />
+      <Edge From="24" To="25" Label="Source1" />
       <Edge From="25" To="26" Label="Source1" />
-      <Edge From="26" To="27" Label="Source1" />
-      <Edge From="26" To="43" Label="Source1" />
+      <Edge From="26" To="27" Label="Source2" />
       <Edge From="27" To="28" Label="Source1" />
       <Edge From="28" To="29" Label="Source1" />
+      <Edge From="28" To="42" Label="Source1" />
       <Edge From="29" To="30" Label="Source1" />
       <Edge From="30" To="31" Label="Source1" />
+      <Edge From="31" To="32" Label="Source1" />
       <Edge From="32" To="33" Label="Source1" />
-      <Edge From="33" To="34" Label="Source1" />
       <Edge From="34" To="35" Label="Source1" />
-      <Edge From="35" To="36" Label="Source1" />
-      <Edge From="37" To="38" Label="Source1" />
-      <Edge From="39" To="40" Label="Source1" />
-      <Edge From="41" To="42" Label="Source1" />
-      <Edge From="43" To="44" Label="Source1" />
+      <Edge From="36" To="37" Label="Source1" />
+      <Edge From="38" To="39" Label="Source1" />
+      <Edge From="40" To="41" Label="Source1" />
+      <Edge From="42" To="43" Label="Source1" />
+      <Edge From="44" To="45" Label="Source1" />
     </Edges>
   </Workflow>
 </WorkflowBuilder>
