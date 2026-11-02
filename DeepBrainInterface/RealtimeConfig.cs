@@ -14,6 +14,7 @@ namespace DeepBrainInterface
     {
         public ProcessPriorityClass ProcessPriority { get; set; }
         public bool TimerResolution1ms { get; set; }
+        public double TimerResolutionMs { get; set; }   // actual system timer resolution after the request (0 = not set)
         public GCLatencyMode GcLatencyMode { get; set; }
         public bool IsServerGC { get; set; }
         public bool PowerThrottlingDisabled { get; set; }
@@ -43,6 +44,8 @@ namespace DeepBrainInterface
 
         [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")] static extern uint TimeBeginPeriod(uint uMilliseconds);
         [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")] static extern uint TimeEndPeriod(uint uMilliseconds);
+        [DllImport("ntdll.dll")] static extern int NtSetTimerResolution(uint DesiredResolution, bool SetResolution, out uint CurrentResolution);
+        [DllImport("ntdll.dll")] static extern int NtQueryTimerResolution(out uint MinimumResolution, out uint MaximumResolution, out uint CurrentResolution);
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool SetProcessInformation(IntPtr hProcess, uint ProcessInformationClass,
@@ -53,9 +56,14 @@ namespace DeepBrainInterface
         // --- Properties ----------------------------------------------------------------------
         [Description("Process priority class. High is the recommended default; RealTime needs administrator rights " +
                      "and starves driver, disk and GC threads (silently falls back to High without admin).")]
-        public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.High;
+        public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.RealTime;
 
-        [Description("Call timeBeginPeriod(1) so timer-based waits wake on a 1 ms grid instead of 15.6 ms.")]
+        [Description("Requested system timer resolution in ms (NtSetTimerResolution). 0.5 is the hardware minimum on most boards; " +
+                     "1 = timeBeginPeriod(1); 0 = leave the system default (15.6 ms). The request is made from the Bonsai process, " +
+                     "so no GlobalTimerResolutionRequests registry key is needed. The achieved value is reported in TimerResolutionMs.")]
+        public double TimerResolutionMs { get; set; } = 0.5;
+
+        [Browsable(false)] // legacy; kept so old workflow files load. TimerResolutionMs replaces it.
         public bool TimerResolution1ms { get; set; } = true;
 
         [Description("GC latency mode. SustainedLowLatency suppresses blocking gen2 collections (needs concurrent GC, Bonsai default).")]
@@ -68,6 +76,10 @@ namespace DeepBrainInterface
         [Description("Restrict the whole process to the performance (P) cores of a hybrid CPU. Process-wide mask, not a pin: " +
                      "threads may still migrate between P-cores. Off by default; measure before enabling.")]
         public bool RestrictToPerformanceCores { get; set; } = false;
+
+        [Description("Explicit process affinity mask (hex, e.g. 3C00 = logical CPUs 10-13). Overrides RestrictToPerformanceCores " +
+                     "when non-empty, so cores 0/1 can be left to the system. Empty = no explicit mask.")]
+        public string AffinityMaskHex { get; set; } = "";
 
         public override IObservable<RealtimeConfigState> Generate()
         {
@@ -89,13 +101,22 @@ namespace DeepBrainInterface
                 try { state.ProcessPriority = proc.PriorityClass; } catch { }
 
                 // 2. Timer resolution
-                if (TimerResolution1ms)
+                if (TimerResolutionMs > 0)
                 {
                     try
                     {
-                        if (TimeBeginPeriod(1) == 0)
+                        uint desired = (uint)Math.Round(TimerResolutionMs * 10000.0);   // 100 ns units
+                        uint actual;
+                        if (NtSetTimerResolution(desired, true, out actual) == 0)
+                        {
+                            state.TimerResolution1ms = actual <= 10000;
+                            state.TimerResolutionMs = actual / 10000.0;
+                            undo.Add(Disposable.Create(() => { uint dummy; try { NtSetTimerResolution(desired, false, out dummy); } catch { } }));
+                        }
+                        else if (TimeBeginPeriod(1) == 0)   // fallback: 1 ms via winmm
                         {
                             state.TimerResolution1ms = true;
+                            state.TimerResolutionMs = 1.0;
                             undo.Add(Disposable.Create(() => { try { TimeEndPeriod(1); } catch { } }));
                         }
                     }
@@ -146,9 +167,13 @@ namespace DeepBrainInterface
                 // 5. Optional process-wide P-core affinity
                 try
                 {
-                    if (RestrictToPerformanceCores)
+                    long explicitMask = 0;
+                    if (!string.IsNullOrWhiteSpace(AffinityMaskHex))
+                        long.TryParse(AffinityMaskHex.Trim().Replace("0x", "").Replace("0X", ""),
+                                      System.Globalization.NumberStyles.HexNumber, null, out explicitMask);
+                    if (explicitMask != 0 || RestrictToPerformanceCores)
                     {
-                        long mask = FindPerformanceCoreMask();
+                        long mask = explicitMask != 0 ? explicitMask : FindPerformanceCoreMask();
                         if (mask != 0)
                         {
                             var previous = proc.ProcessorAffinity;
