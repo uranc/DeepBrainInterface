@@ -40,7 +40,7 @@ namespace DeepBrainInterface
         [Category("3. Hardware")]
         [Description("Number of pre-allocated output Mats cycled through instead of allocating one per inference. " +
                      "Downstream consumers must not hold an emitted Mat for more than this many emissions (256 = ~300 ms at 833 Hz).")]
-        public int OutputRingDepth { get; set; } = 256;
+        public int OutputRingDepth { get; set; } = 0;   // 0 = allocate a fresh Mat per inference (1.1.65 behaviour)
 
         private readonly object _inferenceLock = new object();
         private Mat[] _outRing;
@@ -129,10 +129,13 @@ namespace DeepBrainInterface
             _outSizeBytes = outSize * sizeof(float);
 
             // Output ring: allocated once, cycled per inference (no per-call Mat + finalizer churn)
-            int ringDepth = Math.Max(2, OutputRingDepth);
-            _outRing = new Mat[ringDepth];
-            for (int i = 0; i < ringDepth; i++) _outRing[i] = new Mat(BatchSize, _outCols, Depth.F32, 1);
-            _outIdx = 0;
+            _outRing = null; _outIdx = 0;
+            if (OutputRingDepth > 0)
+            {
+                int ringDepth = Math.Max(2, OutputRingDepth);
+                _outRing = new Mat[ringDepth];
+                for (int i = 0; i < ringDepth; i++) _outRing[i] = new Mat(BatchSize, _outCols, Depth.F32, 1);
+            }
 
             // 4. Pin memory and bind directly to OrtValues 
             _bufIn = new float[inSize];
@@ -215,8 +218,9 @@ namespace DeepBrainInterface
                 _session.RunWithBinding(_runOpts, _binding);
 
                 // Export via the pre-allocated output ring (each emission is a distinct Mat; recycled after OutputRingDepth emissions)
-                var resultMat = _outRing[_outIdx];
-                _outIdx = (_outIdx + 1 == _outRing.Length) ? 0 : _outIdx + 1;
+                Mat resultMat;
+                if (_outRing == null) resultMat = new Mat(BatchSize, _outCols, Depth.F32, 1);   // 1.1.65 path
+                else { resultMat = _outRing[_outIdx]; _outIdx = (_outIdx + 1 == _outRing.Length) ? 0 : _outIdx + 1; }
                 unsafe
                 {
                     Buffer.MemoryCopy(
