@@ -46,6 +46,7 @@ namespace DeepBrainInterface
         private Mat[] _outRing;
         private int _outIdx;
         private bool _hotThreadBoosted;
+        private bool _hotThreadFpuSet;
 
         private InferenceSession _session;
         private OrtIoBinding _binding;
@@ -72,6 +73,8 @@ namespace DeepBrainInterface
             _expectedContiguousStep = Channels * sizeof(float);
 
             // 1. Hardware Subnormal Float Flush 
+            // (also re-applied on the data thread at the first inference: the FPU control word is per thread,
+            //  and since 1.1.67 the session is created at subscribe time on a different thread)
             try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
 
             // 2. Process Escalation (legacy; prefer the RealtimeConfig node and ManagePriority = false).
@@ -157,6 +160,12 @@ namespace DeepBrainInterface
             lock (_inferenceLock)
             {
                 if (_session == null) InitializeSession();
+
+                if (!_hotThreadFpuSet)
+                {
+                    try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
+                    _hotThreadFpuSet = true;
+                }
 
                 if (ManagePriority && !_hotThreadBoosted)
                 {
@@ -339,6 +348,7 @@ namespace DeepBrainInterface
             _runOpts = null;
             _session = null;
             _hotThreadBoosted = false;
+            _hotThreadFpuSet = false;
         }
 
         public void Dispose()
