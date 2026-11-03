@@ -230,8 +230,9 @@ namespace DeepBrainInterface
             }
         }
 
-        // Session creation + warm-up run at subscribe time (workflow start), not on the first data frame
-        // on the acquisition thread. The guard inside RunInference stays as a safety net.
+        // Kept for callers that want an explicit warm-up; NOT called at subscribe any more (1.1.73): creating the
+        // session on the subscribing thread left the acquisition thread without FTZ/DAZ (ORT sets it on the
+        // initialising thread only) and the 11-03 01:06 run fell to ~1/4 real time.
         private void EnsureInitialized()
         {
             lock (_inferenceLock)
@@ -244,7 +245,8 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                EnsureInitialized();
+                // Session is created lazily on the first data frame, on the acquisition thread (as in 1.1.65):
+                // ORT and _controlfp_s then apply FTZ/DAZ to the thread that actually runs inference.
                 return source.Select(m =>
                 {
                     lock (_inferenceLock)
@@ -261,7 +263,8 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                EnsureInitialized();
+                // Session is created lazily on the first data frame, on the acquisition thread (as in 1.1.65):
+                // ORT and _controlfp_s then apply FTZ/DAZ to the thread that actually runs inference.
                 return source.Select(t =>
                 {
                     lock (_inferenceLock)
@@ -279,7 +282,8 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                EnsureInitialized();
+                // Session is created lazily on the first data frame, on the acquisition thread (as in 1.1.65):
+                // ORT and _controlfp_s then apply FTZ/DAZ to the thread that actually runs inference.
                 return source.Select(batch => RunInference(batch));
             });
         }
@@ -291,7 +295,8 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                EnsureInitialized();
+                // Session is created lazily on the first data frame, on the acquisition thread (as in 1.1.65):
+                // ORT and _controlfp_s then apply FTZ/DAZ to the thread that actually runs inference.
                 return source.Select(t =>
                 {
                     lock (_inferenceLock)
@@ -310,7 +315,8 @@ namespace DeepBrainInterface
         {
             return Observable.Defer(() =>
             {
-                EnsureInitialized();
+                // Session is created lazily on the first data frame, on the acquisition thread (as in 1.1.65):
+                // ORT and _controlfp_s then apply FTZ/DAZ to the thread that actually runs inference.
                 return source.Select(t =>
                 {
                     lock (_inferenceLock)
