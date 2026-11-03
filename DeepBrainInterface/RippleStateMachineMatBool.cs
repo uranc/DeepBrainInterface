@@ -31,6 +31,11 @@ namespace DeepBrainInterface
         public float EvidenceTarget { get; set; }
         public int PostRippleMs { get; set; }
         public int TriggerDelayMs { get; set; } // Reverted to int to log the actual applied delay
+        // 1.1.76: remaining node settings, so one DistinctUntilChanged branch can log the full configuration
+        public bool DetectionEnabled { get; set; }
+        public int FramesToWaitBeforeDecay { get; set; }
+        public float ScoreDecayPerFrame { get; set; }
+        public string TriggerDelaySetting { get; set; }   // the configured text ("0" or "[250, 400]"), not the applied value
     }
 
     [Combinator]
@@ -296,6 +301,10 @@ namespace DeepBrainInterface
                 EvidenceTarget = TargetEvidenceScore,
                 PostRippleMs = PostRippleMs,
                 TriggerDelayMs = _currentEventDelay, // Logs the exact INT delay applied to this specific event
+                DetectionEnabled = DetectionEnabled,
+                FramesToWaitBeforeDecay = FramesToWaitBeforeDecay,
+                ScoreDecayPerFrame = ScoreDecayPerFrame,
+                TriggerDelaySetting = TriggerDelayMs,
             };
         }
 

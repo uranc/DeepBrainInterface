@@ -48,6 +48,13 @@ namespace DeepBrainInterface
                     if (outputMat == null || outputMat.Rows != ch || outputMat.Cols != nIn)
                         outputMat = new Mat(ch, nIn, Depth.F32, 1);
 
+                    // Input depth: F32 (legacy, after ConvertScale) or U16/S16 straight from the headstage
+                    // (1.1.76: no ConvertScale needed; the z-score is invariant to the ADC offset and scale).
+                    Depth inDepth = input.Depth;
+                    if (inDepth != Depth.F32 && inDepth != Depth.U16 && inDepth != Depth.S16)
+                        throw new InvalidOperationException("SlidingWindowZScore: input depth must be F32, U16 or S16, got " + inDepth);
+                    int inElem = inDepth == Depth.F32 ? sizeof(float) : sizeof(ushort);
+
                     unsafe
                     {
                         byte* inBytes = (byte*)input.Data.ToPointer();
@@ -63,7 +70,10 @@ namespace DeepBrainInterface
 
                             for (int c = 0; c < ch; c++)
                             {
-                                float val = *(float*)(inBytes + c * inStep + t * sizeof(float));
+                                byte* src = inBytes + c * inStep + t * inElem;
+                                float val = inDepth == Depth.F32 ? *(float*)src
+                                          : inDepth == Depth.U16 ? (float)*(ushort*)src
+                                          : (float)*(short*)src;
                                 double valD = val; // Promote to float64 for math
 
                                 // If buffer is full, subtract the oldest value falling out of the window
