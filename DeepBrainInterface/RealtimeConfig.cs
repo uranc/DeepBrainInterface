@@ -67,7 +67,7 @@ namespace DeepBrainInterface
         public bool TimerResolution1ms { get; set; } = true;
 
         [Description("GC latency mode. SustainedLowLatency suppresses blocking gen2 collections (needs concurrent GC, Bonsai default).")]
-        public GCLatencyMode GcLatencyMode { get; set; } = GCLatencyMode.SustainedLowLatency;
+        public GCLatencyMode GcLatencyMode { get; set; } = GCLatencyMode.Interactive;   // Bonsai Mats are finalizable: SustainedLowLatency lets gen2 grow until a blocking collection freezes the process
 
         [Description("Opt the process out of power throttling (EcoQoS / E-core steering when minimized) and, on Windows 11, " +
                      "out of background timer-resolution coalescing.")]
