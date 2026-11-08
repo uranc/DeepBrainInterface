@@ -16,6 +16,10 @@ namespace DeepBrainInterface.Core
         public int PostRippleMs = 50;
         public string TriggerDelaySetting = "0";
         public Func<long> NowMs;
+        /// <summary>When > 0, hold and delay timing use the hardware clock of each decision (ms = clock * 1000 / Hz) instead of the wall clock:
+        /// deterministic, and required for offline replay.</summary>
+        public double HardwareClockHz;
+        long hwNowMs;
         public int ConfigVersion { get; set; }
 
         static readonly Stopwatch Wall = Stopwatch.StartNew();
@@ -37,6 +41,7 @@ namespace DeepBrainInterface.Core
 
         public RippleOut Update(float[] probs, bool gate, ulong clock)
         {
+            if (HardwareClockHz > 0) hwNowMs = (long)(clock * 1000.0 / HardwareClockHz);
             var r = Update(probs[0], 0f, gate);
             r.Clock = clock; r.Prob0 = probs[0]; r.Prob1 = probs.Length > 1 ? probs[1] : float.NaN;
             return r;
@@ -44,7 +49,7 @@ namespace DeepBrainInterface.Core
 
         public RippleOut Update(float signal, float artProb, bool gateOpen)
         {
-            long now = NowMs();
+            long now = HardwareClockHz > 0 ? hwNowMs : NowMs();
             float reportingScore = scoreTicks;
 
             // 1. TTL refractory period
