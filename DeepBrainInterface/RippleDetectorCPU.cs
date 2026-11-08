@@ -1,5 +1,5 @@
 ﻿using Bonsai;
-using Microsoft.ML.OnnxRuntime;
+using DeepBrainInterface.Core;
 using OpenCV.Net;
 using System;
 using System.Collections.Generic;
@@ -47,88 +47,23 @@ namespace DeepBrainInterface
         private int _outIdx;
         private bool _hotThreadBoosted;
         private bool _hotThreadFpuSet;
-
-        private InferenceSession _session;
-        private OrtIoBinding _binding;
-        private RunOptions _runOpts;
-
-        private float[] _bufIn, _bufOut;
-        private GCHandle _hIn, _hOut;
-        private OrtValue _valIn, _valOut;
-
-        private int _inputStride;
-        private int _expectedBytes;
-        private int _expectedContiguousStep;
-        private int _outCols;
-        private int _outSizeBytes;
-
+        private OrtRunner _runner;
+        private int _inputStride, _expectedBytes, _expectedContiguousStep, _outCols;
         private readonly List<Mat> _inputCache = new List<Mat>(2);
 
         private void InitializeSession()
         {
-            if (_session != null) return;
-
+            if (_runner != null) return;
             _inputStride = TimePoints * Channels;
             _expectedBytes = _inputStride * sizeof(float);
             _expectedContiguousStep = Channels * sizeof(float);
-
-            // 1. Hardware Subnormal Float Flush 
-            // (also re-applied on the data thread at the first inference: the FPU control word is per thread,
-            //  and since 1.1.67 the session is created at subscribe time on a different thread)
             try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
-
-            // 2. Process Escalation (legacy; prefer the RealtimeConfig node and ManagePriority = false).
-            //    The thread boost is applied lazily on the first inference so it lands on the data thread,
-            //    not on whichever thread subscribes.
             if (ManagePriority)
             {
-                try
-                {
-                    using (var process = System.Diagnostics.Process.GetCurrentProcess())
-                        process.PriorityClass = System.Diagnostics.ProcessPriorityClass.RealTime;
-                }
-                catch { }
+                try { using (var process = System.Diagnostics.Process.GetCurrentProcess()) process.PriorityClass = System.Diagnostics.ProcessPriorityClass.RealTime; } catch { }
             }
-
-            // 3. Ultra-Lean CPU ORT Config
-            var opts = new SessionOptions
-            {
-                IntraOpNumThreads = 1, // Hardcoded for real-time determinism
-                InterOpNumThreads = 1,
-                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING,
-                EnableCpuMemArena = true,
-                EnableMemoryPattern = true
-            };
-
-            opts.AddSessionConfigEntry("session.set_denormal_as_zero", "1");
-            opts.AddSessionConfigEntry("session.execution_mode", "ORT_SEQUENTIAL");
-            opts.AddSessionConfigEntry("cpu.arena_extend_strategy", "kSameAsRequested");
-            opts.AddSessionConfigEntry("session.intra_op.allow_spinning", AllowSpinning ? "1" : "0");
-
-            _session = new InferenceSession(ModelPath, opts);
-            _binding = _session.CreateIoBinding();
-            _runOpts = new RunOptions();
-            opts.Dispose();
-
-            long[] inShape = new long[] { BatchSize, TimePoints, Channels };
-            int inSize = BatchSize * _inputStride;
-
-            var outMeta = _session.OutputMetadata.Values.First();
-            long[] outShape = new long[outMeta.Dimensions.Length];
-            int outSize = 1;
-            for (int i = 0; i < outShape.Length; i++)
-            {
-                long d = outMeta.Dimensions[i];
-                if (d <= 0) d = (i == 0) ? BatchSize : 1;
-                outShape[i] = d;
-                outSize *= (int)d;
-            }
-
-            _outCols = outSize / BatchSize;
-            _outSizeBytes = outSize * sizeof(float);
-
-            // Output ring: allocated once, cycled per inference (no per-call Mat + finalizer churn)
+            _runner = new OrtRunner(ModelPath, BatchSize, TimePoints, Channels);   // bound pinned buffers, 50 warm-up runs
+            _outCols = 1;
             _outRing = null; _outIdx = 0;
             if (OutputRingDepth > 0)
             {
@@ -136,100 +71,54 @@ namespace DeepBrainInterface
                 _outRing = new Mat[ringDepth];
                 for (int i = 0; i < ringDepth; i++) _outRing[i] = new Mat(BatchSize, _outCols, Depth.F32, 1);
             }
-
-            // 4. Pin memory and bind directly to OrtValues 
-            _bufIn = new float[inSize];
-            _hIn = GCHandle.Alloc(_bufIn, GCHandleType.Pinned);
-
-            _bufOut = new float[outSize];
-            _hOut = GCHandle.Alloc(_bufOut, GCHandleType.Pinned);
-
-            var memInfo = OrtMemoryInfo.DefaultInstance;
-            _valIn = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufIn), inShape);
-            _valOut = OrtValue.CreateTensorValueFromMemory(memInfo, new Memory<float>(_bufOut), outShape);
-
-            _binding.BindInput(_session.InputMetadata.Keys.First(), _valIn);
-            _binding.BindOutput(_session.OutputMetadata.Keys.First(), _valOut);
-
-            // 5. Deep Warmup
-            for (int i = 0; i < 50; i++)
-            {
-                _session.RunWithBinding(_runOpts, _binding);
-            }
         }
 
         private Mat RunInference(IList<Mat> mats)
         {
             lock (_inferenceLock)
             {
-                if (_session == null) InitializeSession();
-
-                if (!_hotThreadFpuSet)
-                {
-                    try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { }
-                    _hotThreadFpuSet = true;
-                }
-
-                if (ManagePriority && !_hotThreadBoosted)
-                {
-                    try { System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest; } catch { }
-                    _hotThreadBoosted = true;
-                }
-
+                if (_runner == null) InitializeSession();
+                if (!_hotThreadFpuSet) { try { uint c = 0; _controlfp_s(ref c, _DN_FLUSH, _MCW_DN); } catch { } _hotThreadFpuSet = true; }
+                if (ManagePriority && !_hotThreadBoosted) { try { System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest; } catch { } _hotThreadBoosted = true; }
                 unsafe
                 {
-                    float* dstBase = (float*)_hIn.AddrOfPinnedObject().ToPointer();
-
-                    for (int i = 0; i < mats.Count; i++)
+                    fixed (float* dstBase = _runner.Input)
                     {
-                        Mat inputMat = mats[i];
-                        byte* srcBase = (byte*)inputMat.Data.ToPointer();
-                        float* dst = dstBase + (i * _inputStride);
-
-                        if (inputMat.Rows == TimePoints && inputMat.Cols == Channels && inputMat.Step == _expectedContiguousStep)
+                        for (int i = 0; i < mats.Count; i++)
                         {
-                            Buffer.MemoryCopy(srcBase, dst, _expectedBytes, _expectedBytes);
-                        }
-                        else
-                        {
-                            int step = inputMat.Step;
-                            if (inputMat.Rows == Channels && inputMat.Cols == TimePoints)
+                            Mat inputMat = mats[i];
+                            byte* srcBase = (byte*)inputMat.Data.ToPointer();
+                            float* dst = dstBase + (i * _inputStride);
+                            if (inputMat.Rows == TimePoints && inputMat.Cols == Channels && inputMat.Step == _expectedContiguousStep)
                             {
+                                Buffer.MemoryCopy(srcBase, dst, _expectedBytes, _expectedBytes);
+                            }
+                            else if (inputMat.Rows == Channels && inputMat.Cols == TimePoints)
+                            {
+                                int step = inputMat.Step;
                                 for (int c = 0; c < Channels; c++)
                                 {
                                     float* srcRow = (float*)(srcBase + (c * step));
-                                    for (int t = 0; t < TimePoints; t++)
-                                        dst[(t * Channels) + c] = srcRow[t];
+                                    for (int t = 0; t < TimePoints; t++) dst[(t * Channels) + c] = srcRow[t];
                                 }
                             }
                             else
                             {
-                                int cols = inputMat.Cols;
-                                int rowBytes = cols * sizeof(float);
-                                for (int r = 0; r < inputMat.Rows; r++)
-                                {
-                                    Buffer.MemoryCopy(srcBase + (r * step), (byte*)(dst + (r * cols)), rowBytes, rowBytes);
-                                }
+                                int step = inputMat.Step, cols = inputMat.Cols, rowBytes = cols * sizeof(float);
+                                for (int r = 0; r < inputMat.Rows; r++) Buffer.MemoryCopy(srcBase + (r * step), (byte*)(dst + (r * cols)), rowBytes, rowBytes);
                             }
                         }
                     }
                 }
-
-                _session.RunWithBinding(_runOpts, _binding);
-
-                // Export via the pre-allocated output ring (each emission is a distinct Mat; recycled after OutputRingDepth emissions)
+                _runner.Run();
                 Mat resultMat;
                 if (_outRing == null) resultMat = new Mat(BatchSize, _outCols, Depth.F32, 1);   // 1.1.65 path
                 else { resultMat = _outRing[_outIdx]; _outIdx = (_outIdx + 1 == _outRing.Length) ? 0 : _outIdx + 1; }
                 unsafe
                 {
-                    Buffer.MemoryCopy(
-                        _hOut.AddrOfPinnedObject().ToPointer(),
-                        resultMat.Data.ToPointer(),
-                        _outSizeBytes,
-                        _outSizeBytes);
+                    float* o = (float*)resultMat.Data.ToPointer();
+                    for (int b = 0; b < BatchSize; b++) o[b] = _runner.Output[b];
                 }
-
                 return resultMat;
             }
         }
@@ -241,7 +130,7 @@ namespace DeepBrainInterface
         {
             lock (_inferenceLock)
             {
-                if (_session == null) InitializeSession();
+                if (_runner == null) InitializeSession();
             }
         }
 
@@ -336,38 +225,14 @@ namespace DeepBrainInterface
 
         private void ReleaseAllocations()
         {
-            // Release ORT objects first, then unpin the buffers they referenced
-            _binding?.Dispose();
-            _valIn?.Dispose();
-            _valOut?.Dispose();
-            _runOpts?.Dispose();
-            _session?.Dispose();
-
-            if (_hIn.IsAllocated) _hIn.Free();
-            if (_hOut.IsAllocated) _hOut.Free();
-
-            if (_outRing != null)
-            {
-                for (int i = 0; i < _outRing.Length; i++) _outRing[i]?.Dispose();
-                _outRing = null;
-            }
-
-            _valIn = null;
-            _valOut = null;
-            _binding = null;
-            _runOpts = null;
-            _session = null;
-            _hotThreadBoosted = false;
-            _hotThreadFpuSet = false;
+            _runner?.Dispose(); _runner = null;
+            if (_outRing != null) { for (int i = 0; i < _outRing.Length; i++) _outRing[i]?.Dispose(); _outRing = null; }
+            _hotThreadBoosted = false; _hotThreadFpuSet = false;
         }
 
         public void Dispose()
         {
-            lock (_inferenceLock)
-            {
-                ReleaseAllocations();
-                _inputCache.Clear();
-            }
+            lock (_inferenceLock) { ReleaseAllocations(); }
         }
     }
 }
