@@ -19,10 +19,11 @@ namespace DeepBrainInterface
         public bool IsServerGC { get; set; }
         public bool PowerThrottlingDisabled { get; set; }
         public long ProcessorAffinityMask { get; set; }
+        public long PressureBallastBytes { get; set; }   // GC memory-pressure ballast outstanding in this process (0 = none)
     }
 
     [Description("One-shot real-time configuration of the Bonsai process: priority class, 1 ms timer resolution, " +
-                 "GC latency mode, power-throttling (EcoQoS) opt-out and optional P-core affinity. " +
+                 "GC latency mode, optional GC memory-pressure ballast, power-throttling (EcoQoS) opt-out and optional P-core affinity. " +
                  "Emits the applied state once at workflow start and reverts everything when the workflow stops. " +
                  "Use instead of the priority side effects inside detector nodes (set their ManagePriority to false).")]
     public class RealtimeConfig : Source<RealtimeConfigState>
@@ -81,6 +82,18 @@ namespace DeepBrainInterface
                      "when non-empty, so cores 0/1 can be left to the system. Empty = no explicit mask.")]
         public string AffinityMaskHex { get; set; } = "";
 
+        [Description("GC memory-pressure ballast in bytes (0 = off). Applied once per process with GC.AddMemoryPressure and never removed. " +
+                     "On .NET Framework the pressure threshold is reset after every pressure-triggered collection and shrunk by 5% on every " +
+                     "RemoveMemoryPressure, so a driver that registers pressure per frame (clroni, tens of thousands of frames/s) forces " +
+                     "~100 induced collections per second whatever the byte count. A large ballast (8589934592 = 8 GB) parks the threshold " +
+                     "~5% above the outstanding total, out of reach of per-frame add/remove pairs. Costs one induced GC at start and no memory. " +
+                     "Verify with an ETW GC trace: GC/Start reason InducedNoForce should fall to ~0/s. The amount outstanding is reported in " +
+                     "PressureBallastBytes; raising the value in the same process adds only the difference.")]
+        public long PressureBallastBytes { get; set; } = 0;
+
+        static readonly object ballastLock = new object();
+        static long ballastApplied;                      // process-wide, so an editor restart of the workflow does not add it twice
+
         public override IObservable<RealtimeConfigState> Generate()
         {
             return Observable.Create<RealtimeConfigState>(observer =>
@@ -133,6 +146,26 @@ namespace DeepBrainInterface
                 catch { }
                 state.GcLatencyMode = GCSettings.LatencyMode;
                 state.IsServerGC = GCSettings.IsServerGC;
+
+                // 3b. GC memory-pressure ballast: monotone per process, deliberately not undone on stop
+                //     (RemoveMemoryPressure of >= threshold/4 resets the threshold to 100 KB and the per-frame storm returns).
+                if (PressureBallastBytes > 0)
+                {
+                    try
+                    {
+                        lock (ballastLock)
+                        {
+                            long delta = PressureBallastBytes - ballastApplied;
+                            if (delta > 0)
+                            {
+                                GC.AddMemoryPressure(delta);
+                                ballastApplied += delta;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                state.PressureBallastBytes = ballastApplied;
 
                 // 4. Power throttling / EcoQoS opt-out
                 if (DisablePowerThrottling)
