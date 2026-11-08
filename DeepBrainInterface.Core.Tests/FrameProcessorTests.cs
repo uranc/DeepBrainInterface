@@ -93,3 +93,35 @@ public unsafe class FrameProcessorTests
         }
     }
 }
+
+public unsafe class FrameProcessorLiveTests
+{
+    static string Model => Environment.GetEnvironmentVariable("DBI_TEST_MODEL") ?? "/home/uranc/Documents/SWRProject/pi_streaming/model_tripletRemake1334_1Batch.onnx";
+
+    [Fact]
+    public void ActiveModelOneFeedsTheDecisionFromProb1AndNeverNaN()
+    {
+        if (!File.Exists(Model)) return;
+        var cfg = new ProcessorConfig { Channels = new[] { 0, 1, 2, 3, 4, 5, 6, 7 }, DecimationFactor = 12, TimePoints = 44, Stride = 2, ModelPaths = new[] { Model, Model }, StageFactory = p => new IPreprocessStage[] { new ZScoreStage(8, 1250) } };
+        using (var fp = new FrameProcessor(cfg, new RippleFsm()))
+        {
+            var rnd = new Random(5); var buf = new RippleOut[24]; var data = new ushort[8 * 24]; var clocks = new ulong[24]; ulong raw = 0; int seen = 0;
+            for (int f = 0; f < 80; f++)
+            {
+                if (f == 40) fp.SetActiveModels(1);
+                for (int t = 0; t < 24; t++) { clocks[t] = raw++; for (int c = 0; c < 8; c++) data[c * 24 + t] = (ushort)(32768 + 2000 * Math.Sin(0.05 * raw + c) + rnd.Next(-300, 300)); }
+                fixed (ushort* d = data) fixed (ulong* ck = clocks)
+                {
+                    int n = fp.ProcessFrame(d, 8, 24, 48, ck, true, buf);
+                    for (int i = 0; i < n; i++)
+                    {
+                        Assert.False(float.IsNaN(buf[i].Probability), "decision probability must never be NaN");
+                        if (f >= 40) { Assert.True(float.IsNaN(buf[i].Prob0)); Assert.Equal(buf[i].Prob1, buf[i].Probability); seen++; }
+                        else { Assert.True(float.IsNaN(buf[i].Prob1)); Assert.Equal(buf[i].Prob0, buf[i].Probability); }
+                    }
+                }
+            }
+            Assert.True(seen > 0);
+        }
+    }
+}

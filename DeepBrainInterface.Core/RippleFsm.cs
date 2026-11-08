@@ -33,6 +33,13 @@ namespace DeepBrainInterface.Core
 
         public int EventCount { get { return eventCount; } }
 
+        /// <summary>Sets the trigger delay range and, as 1.1.76 did, refreshes the logged delay to the minimum at once.</summary>
+        public void SetDelay(int minMs, int maxMs)
+        {
+            if (minMs > maxMs) { int t = minMs; minMs = maxMs; maxMs = t; }
+            DelayMinMs = minMs; DelayMaxMs = maxMs; currentEventDelay = minMs; ConfigVersion++;
+        }
+
         public void Reset()
         {
             state = RippleState.NoRipple; scoreTicks = 0; ticksDipping = 0;

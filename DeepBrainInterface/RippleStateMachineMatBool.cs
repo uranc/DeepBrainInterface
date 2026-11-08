@@ -51,8 +51,7 @@ namespace DeepBrainInterface
             set
             {
                 fsm.TriggerDelaySetting = value;
-                ParseDelay(value, out fsm.DelayMinMs, out fsm.DelayMaxMs);
-                fsm.ConfigVersion++;
+                int dmin, dmax; ParseDelay(value, out dmin, out dmax); fsm.SetDelay(dmin, dmax);
             }
         }
 

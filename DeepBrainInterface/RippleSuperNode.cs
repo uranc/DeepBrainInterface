@@ -1,4 +1,4 @@
-using Bonsai;
+﻿using Bonsai;
 using DeepBrainInterface.Core;
 using OpenCV.Net;
 using System;
@@ -64,7 +64,7 @@ namespace DeepBrainInterface
         [Category("5. FSM")] public int FramesToWaitBeforeDecay { get { return fsm.FramesToWaitBeforeDecay; } set { fsm.FramesToWaitBeforeDecay = value; fsm.ConfigVersion++; } }
         [Category("5. FSM")] public float ScoreDecayPerFrame { get { return fsm.ScoreDecayPerFrame; } set { fsm.ScoreDecayPerFrame = value; fsm.ConfigVersion++; } }
         [Category("5. FSM")] [Description("'250' fixed or '[250, 400]' uniform random delay in ms before the TTL.")]
-        public string TriggerDelayMs { get { return fsm.TriggerDelaySetting; } set { fsm.TriggerDelaySetting = value; RippleStateMachineMatBool.ParseDelay(value, out fsm.DelayMinMs, out fsm.DelayMaxMs); fsm.ConfigVersion++; } }
+        public string TriggerDelayMs { get { return fsm.TriggerDelaySetting; } set { fsm.TriggerDelaySetting = value; int dmin, dmax; RippleStateMachineMatBool.ParseDelay(value, out dmin, out dmax); fsm.SetDelay(dmin, dmax); } }
         [Category("5. FSM")] public int PostRippleMs { get { return fsm.PostRippleMs; } set { fsm.PostRippleMs = value; fsm.ConfigVersion++; } }
 
         volatile FrameProcessor proc;
@@ -139,7 +139,7 @@ namespace DeepBrainInterface
                     }
                     catch (Exception ex) { observer.OnError(ex); }
                 }, observer.OnError, observer.OnCompleted);
-                return System.Reactive.Disposables.Disposable.Create(() => { sub.Dispose(); var p = proc; proc = null; p?.Dispose(); Interlocked.Exchange(ref subscribed, 0); });
+                return System.Reactive.Disposables.Disposable.Create(() => { sub.Dispose(); var p = proc; proc = null; p?.Dispose(); fpuSet = false; Interlocked.Exchange(ref subscribed, 0); });
             });
         }
 

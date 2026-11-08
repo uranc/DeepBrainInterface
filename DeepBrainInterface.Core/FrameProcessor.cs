@@ -145,8 +145,9 @@ namespace DeepBrainInterface.Core
             if (!rings[0].IsFull) return false;   // phase 0 sets the cadence; later phases join once their own ring is full
             if (++strideCounter < cfg.Stride) return false;
             strideCounter = 0;
-            Infer();
-            float signal = Combine(modelProbs, activeModels);
+            int am = activeModels; Combiner cb = combiner;       // live properties read once per inference
+            Infer(am, cb);
+            float signal = Combine(modelProbs, am, cb);
             stageIn[0] = signal;
             var r = decision.Update(stageIn, gate, clock);
             r.Prob0 = modelProbs[0]; r.Prob1 = nModels > 1 ? modelProbs[1] : float.NaN;
@@ -158,11 +159,11 @@ namespace DeepBrainInterface.Core
             return true;
         }
 
-        void Infer()
+        void Infer(int am, Combiner cb)
         {
             for (int m = 0; m < nModels; m++)
             {
-                bool active = activeModels == 2 || activeModels == m;
+                bool active = am == 2 || am == m;
                 if (!active) { modelProbs[m] = float.NaN; continue; }
                 var run = runners[m];
                 if (batched[m])
@@ -175,14 +176,14 @@ namespace DeepBrainInterface.Core
                 {
                     for (int p = 0; p < nPhase; p++) { if (!rings[p].IsFull) { phaseProbs[m][p] = float.NaN; continue; } rings[p].CopyWindow(run.Input, 0); run.Run(); phaseProbs[m][p] = run.Output[0]; }
                 }
-                modelProbs[m] = CombineArr(phaseProbs[m], nPhase);
+                modelProbs[m] = CombineArr(phaseProbs[m], nPhase, cb);
             }
         }
 
         /// <summary>Combines the per-phase probabilities, ignoring NaN (phases whose ring is not yet full). Phase 0 is always present.</summary>
-        float CombineArr(float[] a, int count)
+        float CombineArr(float[] a, int count, Combiner cb)
         {
-            switch (combiner)
+            switch (cb)
             {
                 case Combiner.Max: { float mx = a[0]; for (int i = 1; i < count; i++) if (!float.IsNaN(a[i]) && a[i] > mx) mx = a[i]; return mx; }
                 case Combiner.Mean: { double s = 0; int k = 0; for (int i = 0; i < count; i++) if (!float.IsNaN(a[i])) { s += a[i]; k++; } return (float)(s / k); }
@@ -190,11 +191,11 @@ namespace DeepBrainInterface.Core
             }
         }
 
-        float Combine(float[] probs, int active)
+        float Combine(float[] probs, int active, Combiner cb)
         {
             if (active == 0) return probs[0];
             if (active == 1) return probs[1];
-            switch (combiner)
+            switch (cb)
             {
                 case Combiner.Max: return Math.Max(probs[0], probs[1]);
                 case Combiner.Mean: return 0.5f * (probs[0] + probs[1]);

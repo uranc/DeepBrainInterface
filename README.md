@@ -35,7 +35,7 @@ outside the frame produces an error naming the field.
 
 `Mat` in (all amplifier rows), `Mat` out: rows reordered by `DisplayOrder`, every `DisplayDecimation`-th sample, `BlockSamples`
 columns per block, F32, from a ring of `RingDepth` pre-allocated Mats. Replaces `SelectChannels`-based display paths, which
-create one finalizable MatHeader per channel per sample.
+create one finalizable MatHeader per channel per sample. Block rate = 30 kHz / DisplayDecimation / BlockSamples; size RingDepth for at least 300 ms at that rate (the workflow uses 60 / 1 / 256 = 500 blocks per second, 512 ms).
 
 ## Workflows
 
@@ -57,3 +57,10 @@ dotnet test DeepBrainInterface.Core.Tests          # Linux or Windows; replay te
 dotnet build DeepBrainInterface -c Release        # produces the .nupkg
 dotnet test DeepBrainInterface.Tests               # Windows (OpenCV.Net / ONNX Runtime natives)
 ```
+
+## Behaviour changes versus 1.1.76 in the kept nodes
+
+- `RippleDetectorCPU` now refuses models whose output is not one value per batch row, and always lets the ORT intra-op pool spin
+  (`AllowSpinning` was already a documented no-op with one thread).
+- `RippleStateMachineMatBool.TriggerDelayMs` behaves as before (the logged delay refreshes to the minimum immediately).
+- Live FSM edits only reach the output when `Decision = Fsm`; with `ThresholdHold`, `PostRippleMs` is fixed at start.

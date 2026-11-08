@@ -89,3 +89,19 @@ public unsafe class RippleSuperNodeTests
         Assert.Equal(64, blocks[0].Rows); Assert.Equal(24, blocks[0].Cols); Assert.Equal(Depth.F32, blocks[0].Depth);
     }
 }
+
+public class RippleSuperNodeResubscribeTests
+{
+    [Fact]
+    public void ResubscribeAfterDisposeWorks()
+    {
+        var node = new RippleSuperNode { ModelPath = Environment.GetEnvironmentVariable("DBI_TEST_MODEL") ?? @"D:\BonsaiModels\ES_model_tripletClean1450.onnx" };
+        if (!System.IO.File.Exists(node.ModelPath)) return;
+        var src = new System.Reactive.Subjects.Subject<Tuple<OpenCV.Net.Mat, ulong[]>>();
+        var obs = node.Process(src);
+        var first = obs.Subscribe(_ => { }); first.Dispose();
+        Exception err = null;
+        using (obs.Subscribe(_ => { }, e => err = e)) { }
+        Assert.Null(err);                                   // Stop/Start in the editor reuses the node instance
+    }
+}

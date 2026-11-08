@@ -97,3 +97,17 @@ public class RippleFsmTests
         Assert.Equal(1, s.EventCount);
     }
 }
+
+public class RippleFsmLiveTests
+{
+    [Fact]
+    public void SetDelayUpdatesLoggedDelayImmediately()
+    {
+        long now = 0;
+        var f = new RippleFsm { NowMs = () => now };
+        f.SetDelay(250, 400);
+        var r = f.Update(new[] { 0.0f }, true, 1);
+        Assert.Equal(250, r.TriggerDelayMs);          // 1.1.76: the setter refreshed the logged delay to the minimum at once
+        Assert.Equal(250, f.DelayMinMs); Assert.Equal(400, f.DelayMaxMs);
+    }
+}
