@@ -1,4 +1,5 @@
 ﻿using Bonsai;
+using DeepBrainInterface.Core;
 using OpenCV.Net;
 using System;
 using System.ComponentModel;
@@ -7,305 +8,70 @@ using System.Reactive.Linq;
 
 namespace DeepBrainInterface
 {
-    public enum RippleState { NoRipple, Possible, Ripple }
-
-    public struct RippleOut
-    {
-        // --- Detection state ---
-        public RippleState State { get; set; }
-        public bool TTL { get; set; }
-        public float Score { get; set; }
-        public int EventCount { get; set; }
-        public float Probability { get; set; }
-        public float ArtifactProbability { get; set; }
-
-        // --- Timing ---
-        public ulong Clock { get; set; }  // hardware ulong clock of the freshest sample
-        public int Skipped { get; set; }  // 0 = inference ran normally; 1 = skipped (e.g. during refractory)
-
-        // --- FSM config snapshot (populated by RippleStateMachineMatBool.Update / SuperNode) ---
-        // Logged alongside detections so CSV captures the active settings at each event.
-        public float Threshold1 { get; set; }  // IgnoreBelow
-        public float Threshold2 { get; set; }  // WeakEvidence
-        public float Threshold3 { get; set; }  // StrongEvidence
-        public float EvidenceTarget { get; set; }
-        public int PostRippleMs { get; set; }
-        public int TriggerDelayMs { get; set; } // Reverted to int to log the actual applied delay
-        // 1.1.76: remaining node settings, so one DistinctUntilChanged branch can log the full configuration
-        public bool DetectionEnabled { get; set; }
-        public int FramesToWaitBeforeDecay { get; set; }
-        public float ScoreDecayPerFrame { get; set; }
-        public string TriggerDelaySetting { get; set; }   // the configured text ("0" or "[250, 400]"), not the applied value
-    }
-
     [Combinator]
-    [Description("Accumulator FSM. Thread-safe with Leaky Bucket Grace Period.")]
+    [Description("Accumulator FSM. Thread-safe with Leaky Bucket Grace Period. Shell over DeepBrainInterface.Core.RippleFsm (1.1.78).")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public sealed class RippleStateMachineMatBool
     {
-        [Category("General")] public bool DetectionEnabled { get; set; } = true;
+        readonly RippleFsm fsm = new RippleFsm();
+        readonly float[] probs = new float[1];
+        readonly object fsmLock = new object();
+
+        [Category("General")] public bool DetectionEnabled { get { return fsm.DetectionEnabled; } set { fsm.DetectionEnabled = value; fsm.ConfigVersion++; } }
 
         [Category("1. Thresholds (0.0 to 1.0)")]
         [Description("Threshold 1 (Floor): If probability drops below this, start the dip timer.")]
-        public float Threshold1_IgnoreBelow { get; set; } = 0.10f;
+        public float Threshold1_IgnoreBelow { get { return fsm.Threshold1; } set { fsm.Threshold1 = value; fsm.ConfigVersion++; } }
 
         [Category("1. Thresholds (0.0 to 1.0)")]
         [Description("Threshold 2 (Weak): Awards 1 evidence point per frame.")]
-        public float Threshold2_WeakEvidence { get; set; } = 0.50f;
+        public float Threshold2_WeakEvidence { get { return fsm.Threshold2; } set { fsm.Threshold2 = value; fsm.ConfigVersion++; } }
 
         [Category("1. Thresholds (0.0 to 1.0)")]
         [Description("Threshold 3 (Strong): Awards 2.5 evidence points per frame.")]
-        public float Threshold3_StrongEvidence { get; set; } = 0.80f;
+        public float Threshold3_StrongEvidence { get { return fsm.Threshold3; } set { fsm.Threshold3 = value; fsm.ConfigVersion++; } }
 
         [Category("2. Scoring")]
         [Description("Total points needed to trigger the hardware TTL.")]
-        public float TargetEvidenceScore { get; set; } = 5.0f;
+        public float TargetEvidenceScore { get { return fsm.TargetEvidenceScore; } set { fsm.TargetEvidenceScore = value; fsm.ConfigVersion++; } }
 
         [Category("3. Leaky Bucket (Anti-Flicker)")]
         [Description("How many consecutive frames to WAIT during a dip BEFORE subtracting points.")]
-        public int FramesToWaitBeforeDecay { get; set; } = 5;
+        public int FramesToWaitBeforeDecay { get { return fsm.FramesToWaitBeforeDecay; } set { fsm.FramesToWaitBeforeDecay = value; fsm.ConfigVersion++; } }
 
         [Category("3. Leaky Bucket (Anti-Flicker)")]
         [Description("How many points to subtract from the score per frame AFTER the wait period.")]
-        public float ScoreDecayPerFrame { get; set; } = 1.0f;
-
-        private string _triggerDelayMs = "0";
-        private int _delayMin = 0;
-        private int _delayMax = 0;
+        public float ScoreDecayPerFrame { get { return fsm.ScoreDecayPerFrame; } set { fsm.ScoreDecayPerFrame = value; fsm.ConfigVersion++; } }
 
         [Category("4. TTL Output")]
         [Description("Delay in milliseconds before triggering the TTL. Enter a single number for a fixed delay (e.g., '250') or a bracketed range for a uniform random delay (e.g., '[250, 400]').")]
         public string TriggerDelayMs
         {
-            get => _triggerDelayMs;
+            get { return fsm.TriggerDelaySetting; }
             set
             {
-                _triggerDelayMs = value;
-                if (string.IsNullOrWhiteSpace(value))
-                {
-                    _delayMin = _delayMax = 0;
-                    return;
-                }
-
-                // Immediately parse and convert to int
-                var parts = value.Trim('[', ']').Split(',');
-                _delayMin = (int)float.Parse(parts[0]);
-                _delayMax = parts.Length > 1 ? (int)float.Parse(parts[1]) : _delayMin;
-
-                // Ensure min <= max
-                if (_delayMin > _delayMax)
-                {
-                    int temp = _delayMin;
-                    _delayMin = _delayMax;
-                    _delayMax = temp;
-                }
-
-                // Initialize the logged delay to the minimum baseline
-                _currentEventDelay = _delayMin;
+                fsm.TriggerDelaySetting = value;
+                ParseDelay(value, out fsm.DelayMinMs, out fsm.DelayMaxMs);
+                fsm.ConfigVersion++;
             }
         }
 
-        [Category("4. TTL Output")] public int PostRippleMs { get; set; } = 50;
+        [Category("4. TTL Output")] public int PostRippleMs { get { return fsm.PostRippleMs; } set { fsm.PostRippleMs = value; fsm.ConfigVersion++; } }
 
-        RippleState _state = RippleState.NoRipple;
-        float _scoreTicks;
-        int _ticksDipping;
-        int _eventCount; // intentionally NOT reset between runs (same as before)
-
-        bool _ttlArmed;
-        long _ttlAtMs;
-        bool _ttlHolding;
-        long _ttlHoldUntilMs;
-        int _currentEventDelay; // Tracks the actual applied delay for the current ripple
-
-        static readonly Stopwatch Clock = Stopwatch.StartNew();
-        private readonly Random _random = new Random();
-        private readonly object _fsmLock = new object();
-
-        /// <summary>Clears detection and TTL state so a workflow restart begins in NoRipple with no pending hold.</summary>
-        private void Reset()
+        /// <summary>"250" -> (250, 250); "[250, 400]" -> (250, 400); blank -> (0, 0). Shared with RippleSuperNode.</summary>
+        public static void ParseDelay(string value, out int min, out int max)
         {
-            lock (_fsmLock)
-            {
-                _state = RippleState.NoRipple;
-                _scoreTicks = 0;
-                _ticksDipping = 0;
-                _ttlArmed = false;
-                _ttlAtMs = 0;
-                _ttlHolding = false;
-                _ttlHoldUntilMs = 0;
-                _currentEventDelay = _delayMin;
-            }
+            min = max = 0;
+            if (string.IsNullOrWhiteSpace(value)) return;
+            var parts = value.Trim('[', ']').Split(',');
+            min = (int)float.Parse(parts[0]);
+            max = parts.Length > 1 ? (int)float.Parse(parts[1]) : min;
+            if (min > max) { int t = min; min = max; max = t; }
         }
 
         public RippleOut Update(float signal, float artProb, bool gateOpen, Mat rawInput)
         {
-            lock (_fsmLock)
-            {
-                long now = Clock.ElapsedMilliseconds;
-                Mat triggerSnapshot = null;
-                float reportingScore = _scoreTicks;
-
-                // 1. Handle TTL Refractory Period
-                if (_ttlHolding)
-                {
-                    if (now >= _ttlHoldUntilMs)
-                    {
-                        _ttlHolding = false;
-                        _state = RippleState.NoRipple;
-                        _scoreTicks = 0;
-                        _ticksDipping = 0;
-                        reportingScore = 0f;
-                    }
-                    else return Pack(signal, artProb, 0f, true, null);
-                }
-
-                // 2. Handle Delayed TTL Trigger
-                if (_ttlArmed)
-                {
-                    if (now >= _ttlAtMs)
-                    {
-                        _ttlArmed = false;
-                        _ttlHolding = true;
-                        _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
-                        triggerSnapshot = rawInput?.Clone();
-                        return Pack(signal, artProb, 0f, true, triggerSnapshot);
-                    }
-                    return Pack(signal, artProb, reportingScore, false, null);
-                }
-
-                // 3. Master Gate Check
-                bool allowed = DetectionEnabled && gateOpen;
-                if (!allowed)
-                {
-                    _state = RippleState.NoRipple;
-                    _scoreTicks = 0;
-                    _ticksDipping = 0;
-                    return Pack(signal, artProb, 0f, false, null);
-                }
-
-                // 4. State Machine Logic
-                switch (_state)
-                {
-                    case RippleState.NoRipple:
-                        if (signal >= Threshold1_IgnoreBelow)
-                        {
-                            _state = RippleState.Possible;
-                            _scoreTicks = 0;
-                            _ticksDipping = 0;
-                        }
-                        reportingScore = 0f;
-                        break;
-
-                    case RippleState.Possible:
-
-                        if (signal >= Threshold1_IgnoreBelow)
-                        {
-                            // We are above the floor. Reset the dip timer.
-                            _ticksDipping = 0;
-
-                            // Accumulate Evidence
-                            if (signal >= Threshold3_StrongEvidence) _scoreTicks += 2.5f;
-                            else if (signal >= Threshold2_WeakEvidence) _scoreTicks += 1.0f;
-
-                            reportingScore = _scoreTicks;
-
-                            // Check Trigger Condition
-                            if (_scoreTicks >= TargetEvidenceScore)
-                            {
-                                _state = RippleState.Ripple;
-                                _eventCount++;
-                                float peakScore = _scoreTicks;
-                                _scoreTicks = 0;
-                                _ticksDipping = 0;
-
-                                if (_delayMin > 0 || _delayMax > 0)
-                                {
-                                    _ttlArmed = true;
-                                    _currentEventDelay = (_delayMin >= _delayMax) ? _delayMin : _random.Next(_delayMin, _delayMax + 1);
-                                    _ttlAtMs = now + _currentEventDelay;
-                                    return Pack(signal, artProb, peakScore, false, null);
-                                }
-                                else
-                                {
-                                    _currentEventDelay = 0;
-                                    _ttlHolding = true;
-                                    _ttlHoldUntilMs = now + Math.Max(1, PostRippleMs);
-                                    triggerSnapshot = rawInput?.Clone();
-                                    return Pack(signal, artProb, peakScore, true, triggerSnapshot);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // The signal dipped below the floor. Start the leaky bucket logic.
-                            _ticksDipping++;
-
-                            if (_ticksDipping > FramesToWaitBeforeDecay)
-                            {
-                                // We held our breath too long. Start bleeding points.
-                                _scoreTicks -= ScoreDecayPerFrame;
-
-                                if (_scoreTicks <= 0)
-                                {
-                                    // The bucket is empty. Hard reset.
-                                    _state = RippleState.NoRipple;
-                                    _scoreTicks = 0;
-                                    _ticksDipping = 0;
-                                    reportingScore = 0f;
-                                }
-                                else
-                                {
-                                    reportingScore = _scoreTicks;
-                                }
-                            }
-                            else
-                            {
-                                // We are inside the grace period. Hold the score steady.
-                                reportingScore = _scoreTicks;
-                            }
-                        }
-                        break;
-
-                    case RippleState.Ripple:
-                        // After a successful trigger, wait until the event completely finishes
-                        if (signal < Threshold1_IgnoreBelow)
-                        {
-                            _state = RippleState.NoRipple;
-                            _scoreTicks = 0;
-                            _ticksDipping = 0;
-                            reportingScore = 0f;
-                        }
-                        break;
-                }
-
-                return Pack(signal, artProb, reportingScore, _ttlHolding, triggerSnapshot);
-            }
-        }
-
-        private RippleOut Pack(float signal, float artProb, float currentScore, bool ttl, Mat data)
-        {
-            return new RippleOut
-            {
-                State = _state,
-                Score = currentScore,
-                Probability = signal,
-                ArtifactProbability = artProb,
-                EventCount = _eventCount,
-                TTL = ttl,
-                Skipped = 0,   // standalone FSM never skips inference
-                // Config snapshot — lets a single CSV Selector capture active settings at each event
-                Threshold1 = Threshold1_IgnoreBelow,
-                Threshold2 = Threshold2_WeakEvidence,
-                Threshold3 = Threshold3_StrongEvidence,
-                EvidenceTarget = TargetEvidenceScore,
-                PostRippleMs = PostRippleMs,
-                TriggerDelayMs = _currentEventDelay, // Logs the exact INT delay applied to this specific event
-                DetectionEnabled = DetectionEnabled,
-                FramesToWaitBeforeDecay = FramesToWaitBeforeDecay,
-                ScoreDecayPerFrame = ScoreDecayPerFrame,
-                TriggerDelaySetting = TriggerDelayMs,
-            };
+            lock (fsmLock) { return fsm.Update(signal, artProb, gateOpen); }
         }
 
         private float GetVal(Mat m)
@@ -313,6 +79,8 @@ namespace DeepBrainInterface
             if (m == null) return 0f;
             unsafe { return *((float*)m.Data.ToPointer()); }
         }
+
+        void Reset() { lock (fsmLock) fsm.Reset(); }
 
         // Every overload resets the FSM state at subscribe (workflow start) via Observable.Defer.
 
@@ -322,72 +90,19 @@ namespace DeepBrainInterface
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, bool>> source)
             => Observable.Defer(() => { Reset(); return source.Select(t => Update(GetVal(t.Item1), 0f, t.Item2, null)); });
 
-        // With clock (scalar) — Zip(RippleDetectorCPU_output, clock) or Tuple<prob, clock> directly.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong>> source)
-            => Observable.Defer(() =>
-            {
-                Reset();
-                return source.Select(t =>
-                {
-                    var result = Update(GetVal(t.Item1), 0f, true, null);
-                    result.Clock = t.Item2;
-                    return result;
-                });
-            });
+            => Observable.Defer(() => { Reset(); return source.Select(t => { var r = Update(GetVal(t.Item1), 0f, true, null); r.Clock = t.Item2; return r; }); });
 
-        // With clock array — Rhd2164.Clock is ulong[] of length TimePoints.
-        // Extract the most recent (last) clock value.
         public IObservable<RippleOut> Process(IObservable<Tuple<Mat, ulong[]>> source)
-            => Observable.Defer(() =>
-            {
-                Reset();
-                return source.Select(t =>
-                {
-                    var result = Update(GetVal(t.Item1), 0f, true, null);
-                    result.Clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL;
-                    return result;
-                });
-            });
+            => Observable.Defer(() => { Reset(); return source.Select(t => { var r = Update(GetVal(t.Item1), 0f, true, null); r.Clock = (t.Item2 != null && t.Item2.Length > 0) ? t.Item2[t.Item2.Length - 1] : 0UL; return r; }); });
 
-        // With clock (scalar) + BNO gate. (Also what Zip(detector, ClockSync) + WithLatestFrom(gate) now produces.)
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong>, bool>> source)
-            => Observable.Defer(() =>
-            {
-                Reset();
-                return source.Select(t =>
-                {
-                    var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
-                    result.Clock = t.Item1.Item2;
-                    return result;
-                });
-            });
+            => Observable.Defer(() => { Reset(); return source.Select(t => { var r = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null); r.Clock = t.Item1.Item2; return r; }); });
 
-        // With clock array + BNO gate.
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, ulong[]>, bool>> source)
-            => Observable.Defer(() =>
-            {
-                Reset();
-                return source.Select(t =>
-                {
-                    var result = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null);
-                    result.Clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL;
-                    return result;
-                });
-            });
+            => Observable.Defer(() => { Reset(); return source.Select(t => { var r = Update(GetVal(t.Item1.Item1), 0f, t.Item2, null); r.Clock = (t.Item1.Item2 != null && t.Item1.Item2.Length > 0) ? t.Item1.Item2[t.Item1.Item2.Length - 1] : 0UL; return r; }); });
 
         public IObservable<RippleOut> Process(IObservable<Tuple<Tuple<Mat, Mat>, bool>> source)
-        {
-            return Observable.Defer(() =>
-            {
-                Reset();
-                return source.Select(t =>
-                {
-                    float prob = GetVal(t.Item1.Item1);
-                    Mat rawData = t.Item1.Item2;
-                    bool gate = t.Item2;
-                    return Update(prob, 0f, gate, rawData);
-                });
-            });
-        }
+            => Observable.Defer(() => { Reset(); return source.Select(t => Update(GetVal(t.Item1.Item1), 0f, t.Item2, t.Item1.Item2)); });
     }
 }

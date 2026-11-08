@@ -1,4 +1,5 @@
-using Bonsai;
+﻿using Bonsai;
+using DeepBrainInterface.Core;
 using Microsoft.ML.OnnxRuntime;
 using OpenCV.Net;
 using System;
