@@ -27,6 +27,7 @@ namespace DeepBrainInterface.Core
         public int TriggerDelayMs { get; set; }
         public bool DetectionEnabled { get; set; }
         public int FramesToWaitBeforeDecay { get; set; }
+        public int DecayWaitMs { get; set; }        // ms grace on the hardware clock (0 = frames)
         public float ScoreDecayPerFrame { get; set; }
         public string TriggerDelaySetting { get; set; }
 

@@ -189,7 +189,7 @@
           <p2:GcLatencyMode>Interactive</p2:GcLatencyMode>
           <p2:DisablePowerThrottling>true</p2:DisablePowerThrottling>
           <p2:RestrictToPerformanceCores>false</p2:RestrictToPerformanceCores>
-          <p2:AffinityMaskHex />
+          <p2:AffinityMaskHex>3C03</p2:AffinityMaskHex>
         </Combinator>
       </Expression>
       <Expression xsi:type="Combinator">
@@ -337,10 +337,10 @@
       </Expression>
       <Expression xsi:type="scr:ExpressionTransform">
         <scr:Name>FsmParams</scr:Name>
-        <scr:Expression>new(Threshold1 as T1, Threshold2 as T2, Threshold3 as T3, EvidenceTarget as Target, PostRippleMs as PostRippleMs, TriggerDelayMs as TriggerDelayMs)</scr:Expression>
+        <scr:Expression>new(ConfigVersion as ConfigVersion, Clock as Clock, DetectionEnabled as Enabled, Threshold1 as T1, Threshold2 as T2, Threshold3 as T3, EvidenceTarget as Target, FramesToWaitBeforeDecay as DecayWaitFrames, DecayWaitMs as DecayWaitMs, ScoreDecayPerFrame as DecayPerFrame, TriggerDelaySetting as TriggerDelay, PostRippleMs as PostRippleMs)</scr:Expression>
       </Expression>
-      <Expression xsi:type="Combinator">
-        <Combinator xsi:type="rx:DistinctUntilChanged" />
+      <Expression xsi:type="rx:DistinctUntilChangedBy">
+        <rx:KeySelector>ConfigVersion</rx:KeySelector>
       </Expression>
       <Expression xsi:type="Combinator">
         <Combinator xsi:type="rx:Timestamp" />
@@ -351,7 +351,7 @@
         <io:Overwrite>false</io:Overwrite>
         <io:Suffix>FileCount</io:Suffix>
         <io:IncludeHeader>true</io:IncludeHeader>
-        <io:Selector>Timestamp,Value.T1,Value.T2,Value.T3,Value.Target,Value.PostRippleMs,Value.TriggerDelayMs</io:Selector>
+        <io:Selector>Timestamp,Value.ConfigVersion,Value.Clock,Value.Enabled,Value.T1,Value.T2,Value.T3,Value.Target,Value.DecayWaitFrames,Value.DecayWaitMs,Value.DecayPerFrame,Value.TriggerDelay,Value.PostRippleMs</io:Selector>
       </Expression>
       <Expression xsi:type="MemberSelector">
         <Selector>Probability</Selector>
@@ -361,7 +361,7 @@
       </Expression>
       <Expression xsi:type="Combinator">
         <Combinator xsi:type="p2:RippleDisplayBlock">
-          <p2:DisplayOrder>
+          <p2:ChannelMap>
             <p2:int>42</p2:int>
             <p2:int>63</p2:int>
             <p2:int>48</p2:int>
@@ -426,7 +426,8 @@
             <p2:int>1</p2:int>
             <p2:int>9</p2:int>
             <p2:int>6</p2:int>
-          </p2:DisplayOrder>
+          </p2:ChannelMap>
+          <p2:Channels />
           <p2:DisplayDecimation>60</p2:DisplayDecimation>
           <p2:BlockSamples>1</p2:BlockSamples>
           <p2:RingDepth>256</p2:RingDepth>
@@ -675,12 +676,6 @@
               <Name>EphysScaled</Name>
             </Expression>
             <Expression xsi:type="Combinator">
-              <Combinator xsi:type="dsp:Buffer">
-                <dsp:Count>1</dsp:Count>
-                <dsp:Skip>5</dsp:Skip>
-              </Combinator>
-            </Expression>
-            <Expression xsi:type="Combinator">
               <Combinator xsi:type="rx:ObserveOn">
                 <rx:Scheduler>NewThreadScheduler</rx:Scheduler>
               </Combinator>
@@ -799,29 +794,29 @@
             </Expression>
           </Nodes>
           <Edges>
-            <Edge From="0" To="2" Label="Source1" />
-            <Edge From="2" To="4" Label="Source1" />
-            <Edge From="3" To="4" Label="Source2" />
-            <Edge From="4" To="6" Label="Source1" />
-            <Edge From="5" To="6" Label="Source2" />
+            <Edge From="0" To="1" Label="Source1" />
+            <Edge From="1" To="3" Label="Source1" />
+            <Edge From="2" To="3" Label="Source2" />
+            <Edge From="3" To="5" Label="Source1" />
+            <Edge From="4" To="5" Label="Source2" />
+            <Edge From="5" To="6" Label="Source1" />
+            <Edge From="5" To="8" Label="Source1" />
+            <Edge From="5" To="13" Label="Source1" />
             <Edge From="6" To="7" Label="Source1" />
-            <Edge From="6" To="9" Label="Source1" />
-            <Edge From="6" To="14" Label="Source1" />
-            <Edge From="7" To="8" Label="Source1" />
-            <Edge From="8" To="12" Label="Source1" />
+            <Edge From="7" To="11" Label="Source1" />
+            <Edge From="8" To="9" Label="Source1" />
             <Edge From="9" To="10" Label="Source1" />
-            <Edge From="10" To="11" Label="Source1" />
-            <Edge From="11" To="12" Label="Source2" />
-            <Edge From="12" To="13" Label="Source1" />
-            <Edge From="13" To="17" Label="Source1" />
+            <Edge From="10" To="11" Label="Source2" />
+            <Edge From="11" To="12" Label="Source1" />
+            <Edge From="12" To="16" Label="Source1" />
+            <Edge From="13" To="14" Label="Source1" />
             <Edge From="14" To="15" Label="Source1" />
-            <Edge From="15" To="16" Label="Source1" />
-            <Edge From="16" To="17" Label="Source2" />
+            <Edge From="15" To="16" Label="Source2" />
+            <Edge From="16" To="17" Label="Source1" />
             <Edge From="17" To="18" Label="Source1" />
             <Edge From="18" To="19" Label="Source1" />
             <Edge From="19" To="20" Label="Source1" />
             <Edge From="20" To="21" Label="Source1" />
-            <Edge From="21" To="22" Label="Source1" />
           </Edges>
         </Workflow>
       </Expression>

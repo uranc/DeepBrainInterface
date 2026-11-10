@@ -1,7 +1,7 @@
 # DeepBrainInterface
 
 Bonsai package for real-time closed-loop ripple detection on ONIX (OpenEphys.Onix1) with an ONNX TCN model and a hardware TTL
-output. Version 1.1.78.
+output. Version 1.1.79.
 
 ## Packages in this repository
 
@@ -33,15 +33,28 @@ outside the frame produces an error naming the field.
 
 ## RippleDisplayBlock
 
-`Mat` in (all amplifier rows), `Mat` out: rows reordered by `DisplayOrder`, every `DisplayDecimation`-th sample, `BlockSamples`
+`Mat` in (all amplifier rows), `Mat` out: rows reordered by `ChannelMap` (the probe order, one entry per input row, comma-separated),
+then `Channels` picks rows out of that order (indices into the mapped order, empty = all; the output has one row per entry, so
+"add a cortical contact" or "move deeper" is a change of this list only), every `DisplayDecimation`-th sample, `BlockSamples`
 columns per block, F32, from a ring of `RingDepth` pre-allocated Mats. Replaces `SelectChannels`-based display paths, which
 create one finalizable MatHeader per channel per sample. Block rate = 30 kHz / DisplayDecimation / BlockSamples; size RingDepth for at least 300 ms at that rate (the workflow uses 60 / 1 / 256 = 500 blocks per second, 512 ms).
 
 ## Workflows
 
 - `workflows/phase0_supernode.bonsai`: the phase0 socket workflow with the chain replaced by `RippleSuperNode`, the display fed by
-  `RippleDisplayBlock` (all 64 channels, probe order, µV), and the decisions CSV extended with
-  `ConfigVersion,Prob0,Prob1,DecisionIndex`.
+  `RippleDisplayBlock` (all 64 channels, probe order, µV), the decisions CSV extended with
+  `ConfigVersion,Prob0,Prob1,DecisionIndex`, and `ripple_config_N.csv` written once per parameter change (DistinctUntilChangedBy
+  on `ConfigVersion`) with the hardware `Clock` of the first decision under the new parameters, so every row of the decisions
+  CSV joins to the parameters in force.
+
+### 1.1.79 (property level only, data path unchanged; replay test bit-identical to 1.1.78)
+
+- Channel lists edit as comma-separated text (`Channels`, `ChannelMap`).
+- `PhaseCount` documented: P phases = P shifted decimated copies, each with its own preprocessing state and window, run as one
+  batch [P, TimePoints, Channels] when the ONNX batch dimension allows it, else as P calls (the deployed models are batch 1).
+- `ModelPath2` / `ActiveModels` marked optional (one model, `ActiveModels` 0, is the deployed setup); `Ema` marked experimental.
+- Decision options split into sub-groups; FSM parameters back in their 1.1.76 groups (Thresholds, Scoring, Leaky Bucket, TTL Output).
+- `DecayWaitMs`: with `UseHardwareClock`, the leaky-bucket grace can be given in ms of the headstage clock instead of frames.
 
 ## Why
 

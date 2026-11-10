@@ -96,6 +96,27 @@ public class RippleFsmTests
         t += 50; Assert.False(s.Update(P(0.0f), true, 8).TTL);
         Assert.Equal(1, s.EventCount);
     }
+
+    [Fact]
+    public void DecayWaitMsOnHardwareClock()
+    {
+        // 250 MHz clock, one decision every 1.2 ms (300000 ticks). DecayWaitMs 6: dips inside 6 ms of the first dip keep the score, the next one decays.
+        var f = new RippleFsm { Threshold1 = 0.1f, Threshold2 = 0.5f, Threshold3 = 0.8f, TargetEvidenceScore = 100f, FramesToWaitBeforeDecay = 1, DecayWaitMs = 6, ScoreDecayPerFrame = 1f, HardwareClockHz = 250e6 };
+        ulong t = 0, step = 300000;
+        f.Update(P(0.9f), true, t); t += step; f.Update(P(0.9f), true, t);        // score 2.5
+        for (int i = 0; i < 5; i++) { t += step; Assert.Equal(2.5f, f.Update(P(0.05f), true, t).Score); }   // first dip at +0, next four at +1.2 .. +4.8 ms
+        t += step; Assert.Equal(2.5f, f.Update(P(0.05f), true, t).Score);          // +6.0 ms: not yet beyond the wait
+        t += step; Assert.Equal(1.5f, f.Update(P(0.05f), true, t).Score);          // +7.2 ms: decays
+    }
+
+    [Fact]
+    public void DecayWaitMsIgnoredWithoutHardwareClock()
+    {
+        var f = Make(100f); f.DecayWaitMs = 1000;
+        f.Update(P(0.9f), true, 1); f.Update(P(0.9f), true, 2);
+        for (int i = 0; i < 5; i++) f.Update(P(0.05f), true, 10 + (ulong)i);
+        Assert.Equal(1.5f, f.Update(P(0.05f), true, 20).Score);                     // frames rule still applies
+    }
 }
 
 public class RippleFsmLiveTests
@@ -110,4 +131,5 @@ public class RippleFsmLiveTests
         Assert.Equal(250, r.TriggerDelayMs);          // 1.1.76: the setter refreshed the logged delay to the minimum at once
         Assert.Equal(250, f.DelayMinMs); Assert.Equal(400, f.DelayMaxMs);
     }
+
 }

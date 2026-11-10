@@ -11,6 +11,9 @@ namespace DeepBrainInterface.Core
         public float Threshold1 = 0.10f, Threshold2 = 0.50f, Threshold3 = 0.80f;
         public float TargetEvidenceScore = 5.0f;
         public int FramesToWaitBeforeDecay = 5;
+        /// <summary>Grace period before decay in milliseconds of the hardware clock (0 = count frames with FramesToWaitBeforeDecay).
+        /// Only used when HardwareClockHz > 0.</summary>
+        public int DecayWaitMs = 0;
         public float ScoreDecayPerFrame = 1.0f;
         public int DelayMinMs, DelayMaxMs;
         public int PostRippleMs = 50;
@@ -26,7 +29,7 @@ namespace DeepBrainInterface.Core
         readonly Random random = new Random();
 
         RippleState state = RippleState.NoRipple;
-        float scoreTicks; int ticksDipping; int eventCount;
+        float scoreTicks; int ticksDipping; int eventCount; long dipStartMs;
         bool ttlArmed; long ttlAtMs; bool ttlHolding; long ttlHoldUntilMs; int currentEventDelay;
 
         public RippleFsm() { NowMs = () => Wall.ElapsedMilliseconds; }
@@ -120,8 +123,9 @@ namespace DeepBrainInterface.Core
                     }
                     else
                     {
-                        ticksDipping++;
-                        if (ticksDipping > FramesToWaitBeforeDecay)
+                        if (ticksDipping++ == 0) dipStartMs = now;
+                        bool beyondGrace = (HardwareClockHz > 0 && DecayWaitMs > 0) ? (now - dipStartMs > DecayWaitMs) : (ticksDipping > FramesToWaitBeforeDecay);
+                        if (beyondGrace)
                         {
                             scoreTicks -= ScoreDecayPerFrame;
                             if (scoreTicks <= 0) { state = RippleState.NoRipple; scoreTicks = 0; ticksDipping = 0; reportingScore = 0f; }
@@ -145,7 +149,7 @@ namespace DeepBrainInterface.Core
                 State = state, Score = currentScore, Probability = signal, ArtifactProbability = artProb, EventCount = eventCount, TTL = ttl, Skipped = 0,
                 Threshold1 = Threshold1, Threshold2 = Threshold2, Threshold3 = Threshold3, EvidenceTarget = TargetEvidenceScore,
                 PostRippleMs = PostRippleMs, TriggerDelayMs = currentEventDelay, DetectionEnabled = DetectionEnabled,
-                FramesToWaitBeforeDecay = FramesToWaitBeforeDecay, ScoreDecayPerFrame = ScoreDecayPerFrame, TriggerDelaySetting = TriggerDelaySetting,
+                FramesToWaitBeforeDecay = FramesToWaitBeforeDecay, DecayWaitMs = DecayWaitMs, ScoreDecayPerFrame = ScoreDecayPerFrame, TriggerDelaySetting = TriggerDelaySetting,
                 ConfigVersion = ConfigVersion, Prob0 = float.NaN, Prob1 = float.NaN,
             };
         }
