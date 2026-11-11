@@ -12,7 +12,7 @@
 		<PackageTags>Bonsai Rx DeepBrainInterface</PackageTags>
 		<TargetFramework>net472</TargetFramework>
 		<Features>strict</Features>
-		<Version>1.1.79</Version>
+		<Version>1.1.80</Version>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<Platforms>x64</Platforms>
 	</PropertyGroup>
@@ -41,7 +41,6 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\DeepBrainInterface.Core\DeepBrainInterface.Core.csproj" PrivateAssets="all" />
 	</ItemGroup>
 	<ItemGroup>
 		<Reference Include="System.Design" />
@@ -50,7 +49,6 @@
 
 	<ItemGroup>
 		<None Include="logo.png" Pack="true" PackagePath="" />
-		<None Include="..\DeepBrainInterface.Core\bin\$(Configuration)\netstandard2.0\DeepBrainInterface.Core.dll" Pack="true" PackagePath="lib\net472" Visible="false" />
 	</ItemGroup>
 
 </Project>

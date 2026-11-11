@@ -10,7 +10,7 @@ namespace DeepBrainInterface
     [Description("Display blocks for SendMatOverSocket without per-frame allocation: reorders the rows by ChannelMap (probe order), picks the rows " +
                  "listed in Channels (indices into the mapped order; empty = all), keeps every DisplayDecimation-th sample, and emits F32 Mats of " +
                  "BlockSamples columns from a ring of RingDepth Mats allocated at start. Consumers must copy within RingDepth blocks (the socket " +
-                 "sender serialises synchronously). 1.1.79.")]
+                 "sender serialises synchronously). 1.1.80.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleDisplayBlock
     {

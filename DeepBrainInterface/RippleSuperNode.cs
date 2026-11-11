@@ -16,7 +16,7 @@ namespace DeepBrainInterface
     [Combinator]
     [Description("Closed-loop ripple detection in one node: decimation (with phases), preprocessing, windowing, ONNX inference and the " +
                  "decision stage, with no allocation on the data path after start. Input: Zip(AmplifierData Mat, Clock ulong[]), optionally " +
-                 "WithLatestFrom(gate bool). Output: RippleOut per inference, as RippleStateMachineMatBool. 1.1.79.")]
+                 "WithLatestFrom(gate bool). Output: RippleOut per inference, as RippleStateMachineMatBool. 1.1.80.")]
     [WorkflowElementCategory(ElementCategory.Transform)]
     public class RippleSuperNode : IDisposable
     {
