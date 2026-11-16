@@ -39,6 +39,12 @@ namespace DeepBrainInterface.Core
             Array.Copy(buf, head * channels, dst, dstOffset, timePoints * channels);
         }
 
+        /// <summary>Copies the newest `rows` samples, oldest first, to dst[dstOffset..].</summary>
+        public void CopyTail(float[] dst, int dstOffset, int rows)
+        {
+            Array.Copy(buf, (head + timePoints - rows) * channels, dst, dstOffset, rows * channels);
+        }
+
         public void Reset() { head = 0; count = 0; Array.Clear(buf, 0, buf.Length); }
     }
 }

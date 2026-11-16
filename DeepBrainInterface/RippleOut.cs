@@ -37,5 +37,9 @@ namespace DeepBrainInterface.Core
         public float Prob1 { get; set; }
         public long DecisionIndex { get; set; }     // inferences since subscribe
         public float[] SnapshotWindow { get; set; } // model input at a TTL rise when enabled, else null
+
+        // --- streaming runner ---
+        public float InferenceUs { get; set; }      // Stopwatch time of the model run(s) for this decision
+        public int StateResets { get; set; }        // streaming state resets (clock gaps) since subscribe
     }
 }
