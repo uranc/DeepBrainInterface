@@ -51,13 +51,13 @@ namespace DeepBrainInterface
         public float EmaAlpha { get; set; } = 0.01f;
 
         [Category("3. Model")] [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
-        [Description("ONNX model, input [batch, TimePoints, Channels], output [batch, 1] probability. Model 0.")]
+        [Description("ONNX model 0. Windowed: input [batch, TimePoints, Channels], output [batch, 1] probability. Streaming (detected from the file: every input X with an output X_out is a state, fed back each call): data input [1, B, Channels], output [1, B]; Stride must equal B, TimePoints is ignored, initial states from the metadata key state_init, states reset on a clock gap. Set Preprocessing to None for models that normalise internally.")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
         [Category("3. Model")] [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
-        [Description("OPTIONAL second model (model 1), same shapes. Leave empty to run one model, which is the deployed setup; ActiveModels must then stay 0.")]
+        [Description("OPTIONAL second model (model 1), windowed or streaming (two streaming models need the same B). Leave empty to run one model, which is the deployed setup; ActiveModels must then stay 0.")]
         public string ModelPath2 { get; set; } = "";
-        [Category("3. Model")] [Description("Window length in kept samples (44 for the deployed models).")] public int TimePoints { get; set; } = 44;
-        [Category("3. Model")] [Description("Inference every Stride kept samples (2 = every 0.8 ms at 2.5 kHz). Same as Buffer(TimePoints, Stride).")] public int Stride { get; set; } = 2;
+        [Category("3. Model")] [Description("Window length in kept samples (44 for the deployed models). Ignored by streaming models.")] public int TimePoints { get; set; } = 44;
+        [Category("3. Model")] [Description("Inference every Stride kept samples (2 = every 0.8 ms at 2.5 kHz). Same as Buffer(TimePoints, Stride). Must equal B for streaming models.")] public int Stride { get; set; } = 2;
 
         [Category("4. Decision")]
         [Description("Fsm = the deployed RippleStateMachineMatBool logic (groups 5a-5d). ThresholdHold = minimal alternative (group 4b): TTL when the probability " +
@@ -107,6 +107,8 @@ namespace DeepBrainInterface
         public int PostRippleMs { get { return fsm.PostRippleMs; } set { fsm.PostRippleMs = value; fsm.ConfigVersion++; } }
 
         volatile FrameProcessor proc;
+        [Category("3. Model")] [Description("Read-only: kind of each loaded model, set when the workflow starts.")] [System.Xml.Serialization.XmlIgnore]
+        public string ModelInfo { get; private set; } = "";
         int subscribed;
         bool fpuSet;
 
@@ -131,7 +133,10 @@ namespace DeepBrainInterface
             IDecisionStage stage;
             if (Decision == DecisionKind.ThresholdHold) stage = new ThresholdHoldStage(HoldThreshold, HoldConsecutive, PostRippleMs);
             else { fsm.HardwareClockHz = UseHardwareClock ? HardwareClockHz : 0; fsm.Reset(); stage = fsm; }
-            return new FrameProcessor(cfg, stage);
+            var fp = new FrameProcessor(cfg, stage);
+            ModelInfo = "model 0: " + fp.ModelInfo(0) + (cfg.ModelPaths.Length > 1 ? " | model 1: " + fp.ModelInfo(1) : "");
+            System.Diagnostics.Trace.WriteLine("RippleSuperNode: " + ModelInfo + "; preprocessing " + kind);
+            return fp;
         }
 
         /// <summary>One subscription per node instance; the processor is created on the first frame, on the data thread
