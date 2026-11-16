@@ -54,7 +54,7 @@ namespace DeepBrainInterface
         [Description("ONNX model 0. Windowed: input [batch, TimePoints, Channels], output [batch, 1] probability. Streaming (detected from the file: every input X with an output X_out is a state, fed back each call): data input [1, B, Channels], output [1, B]; Stride must equal B, TimePoints is ignored, initial states from the metadata key state_init, states reset on a clock gap. Set Preprocessing to None for models that normalise internally.")]
         public string ModelPath { get; set; } = @"ripple_detector.onnx";
         [Category("3. Model")] [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", typeof(UITypeEditor))]
-        [Description("OPTIONAL second model (model 1), windowed or streaming (two streaming models need the same B). Leave empty to run one model, which is the deployed setup; ActiveModels must then stay 0.")]
+        [Description("OPTIONAL second model (model 1), windowed or streaming (two streaming models need the same B). Mixed with a windowed model, the streaming model joins at the first full TimePoints window and after each clock gap both models restart from an empty window. Leave empty to run one model, which is the deployed setup; ActiveModels must then stay 0.")]
         public string ModelPath2 { get; set; } = "";
         [Category("3. Model")] [Description("Window length in kept samples (44 for the deployed models). Ignored by streaming models.")] public int TimePoints { get; set; } = 44;
         [Category("3. Model")] [Description("Inference every Stride kept samples (2 = every 0.8 ms at 2.5 kHz). Same as Buffer(TimePoints, Stride). Must equal B for streaming models.")] public int Stride { get; set; } = 2;

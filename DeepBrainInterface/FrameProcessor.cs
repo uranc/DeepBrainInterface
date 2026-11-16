@@ -197,7 +197,7 @@ namespace DeepBrainInterface.Core
             return true;
         }
 
-        /// <summary>Streaming models: the expected kept-sample clock step is the first observed step; a step above 1.5x that,
+        /// <summary>Streaming models: the expected kept-sample clock step is the smallest positive step seen so far; a step above 1.5x that,
         /// or a clock that does not advance, is an acquisition gap: states back to their initial values, ring and stride restart.</summary>
         void CheckClock(ulong clock)
         {
@@ -205,6 +205,7 @@ namespace DeepBrainInterface.Core
             {
                 long step = (long)(clock - lastClock);
                 if (clockSeen == 1 && step > 0) { keptStep = step; clockSeen = 2; }
+                else if (step > 0 && step < keptStep) keptStep = step;   // a gap inside the first step must not inflate the rule
                 else if (step <= 0 || (clockSeen == 2 && step * 2 > keptStep * 3))
                 {
                     for (int m = 0; m < nModels; m++) streams[m]?.ResetStates();
