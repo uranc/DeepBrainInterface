@@ -41,5 +41,6 @@ namespace DeepBrainInterface.Core
         // --- streaming runner ---
         public float InferenceUs { get; set; }      // Stopwatch time of the model run(s) for this decision
         public int StateResets { get; set; }        // streaming state resets (clock gaps) since subscribe
+        public int SkippedCalls { get; set; }       // inferences skipped by the stall guard (MaxLagMs) since subscribe
     }
 }

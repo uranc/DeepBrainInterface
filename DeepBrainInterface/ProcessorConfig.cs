@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace DeepBrainInterface.Core
 {
@@ -25,5 +26,12 @@ namespace DeepBrainInterface.Core
         public Combiner Combiner = Combiner.First;
         /// <summary>Attach the phase-0 model input to RippleOut on a TTL rise (reused array).</summary>
         public bool SnapshotEnabled = false;
+        /// <summary>Stall guard: a frame whose newest sample arrives more than MaxLagMs later than the best arrival seen
+        /// (wall clock vs hardware clock) is pushed into the window but produces no inference and no decision. 0 = off.</summary>
+        public float MaxLagMs = 0;
+        /// <summary>Hardware clock rate of the frame clocks (ONIX: 250 MHz).</summary>
+        public double ClockHz = 250e6;
+        /// <summary>Wall clock in Stopwatch ticks (replaceable for tests).</summary>
+        public Func<long> Timestamp = Stopwatch.GetTimestamp;
     }
 }

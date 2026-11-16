@@ -71,6 +71,11 @@ namespace DeepBrainInterface
                      "Same cost either way.")]
         public bool UseHardwareClock { get; set; } = false;
         [Category("4c. Decision: timing")] [Description("Headstage clock rate (ONIX: 250e6).")] public double HardwareClockHz { get; set; } = 250e6;
+        [Category("4c. Decision: timing")]
+        [Description("Stall guard: a frame that arrives more than MaxLagMs later than the best arrival seen (Stopwatch vs hardware clock, drift-tolerant) " +
+                     "is still pushed into the window, but runs no inference and writes no decision, so a backlog after a PC stall fires no stale TTL " +
+                     "and clears at copy speed. Counted in SkippedCalls. 0 = off (every frame is processed, as before).")]
+        public float MaxLagMs { get; set; } = 2f;
 
         [Category("6. Snapshot")] [Description("Attach the model input window ([TimePoints x Channels] after preprocessing, reused array) to RippleOut on each TTL rise. " +
                                                "Not written by the CSV writer unless SnapshotWindow is added to its selector.")]
@@ -119,6 +124,7 @@ namespace DeepBrainInterface
                 Channels = (int[])Channels.Clone(), DecimationFactor = DecimationFactor, PhaseCount = PhaseCount, TimePoints = TimePoints, Stride = Stride,
                 ModelPaths = string.IsNullOrWhiteSpace(ModelPath2) ? new[] { ModelPath } : new[] { ModelPath, ModelPath2 },
                 ActiveModels = activeModels, Combiner = combiner, SnapshotEnabled = SnapshotEnabled,
+                MaxLagMs = MaxLagMs, ClockHz = HardwareClockHz,
             };
             int ch = cfg.Channels.Length; var kind = Preprocessing; int zw = ZScoreWindow; float eps = ZScoreEps, alpha = EmaAlpha;
             cfg.StageFactory = p =>

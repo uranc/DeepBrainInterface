@@ -32,6 +32,8 @@ namespace DeepBrainInterface.Core
         bool lastTtl;
         ulong lastClock; long keptStep; int clockSeen;   // gap detection (streaming models only)
         int stateResets;
+        readonly double ticksPerClock; readonly double maxLagTicks;   // stall guard (MaxLagMs)
+        double baseOffset = double.PositiveInfinity; ulong lagClock; bool skipFrame; int skippedCalls;
         static readonly double usPerTick = 1e6 / Stopwatch.Frequency;
 
         public FrameProcessor(ProcessorConfig config, IDecisionStage decisionStage)
@@ -89,12 +91,16 @@ namespace DeepBrainInterface.Core
             ringLen = allStream ? block : cfg.TimePoints;
             for (int p = 0; p < nPhase; p++) rings[p] = new WindowRing(ringLen, nCh);
             snapshot = cfg.SnapshotEnabled ? new float[ringLen * nCh] : null;
+            ticksPerClock = Stopwatch.Frequency / cfg.ClockHz;
+            maxLagTicks = cfg.MaxLagMs > 0 ? cfg.MaxLagMs * 1e-3 * Stopwatch.Frequency : 0;
             strideCounter = cfg.Stride - 1;   // first full window emits at once (Bonsai.Dsp Buffer semantics)
         }
 
         public long DecisionIndex { get { return decisionIndex; } }
         /// <summary>State resets of the streaming models since construction (clock gaps).</summary>
         public int StateResets { get { return stateResets; } }
+        /// <summary>Inferences skipped by the stall guard since construction.</summary>
+        public int SkippedCalls { get { return skippedCalls; } }
         /// <summary>"Windowed [1,44,8]" or "Streaming B=2, 14 states" for model m.</summary>
         public string ModelInfo(int m) { return infos[m]; }
         public int ActiveModels { get { return activeModels; } }
@@ -115,6 +121,7 @@ namespace DeepBrainInterface.Core
         public int ProcessFrame(ushort* data, int rows, int cols, int stepBytes, ulong* clocks, bool gate, RippleOut[] outBuf)
         {
             CheckRows(rows);
+            skipFrame = cols > 0 && Lagging(clocks[cols - 1]);
             int n = 0;
             for (int t = 0; t < cols; t++)
             {
@@ -132,6 +139,7 @@ namespace DeepBrainInterface.Core
         public int ProcessFrameF32(float* data, int rows, int cols, int stepBytes, ulong* clocks, bool gate, RippleOut[] outBuf)
         {
             CheckRows(rows);
+            skipFrame = cols > 0 && Lagging(clocks[cols - 1]);
             int n = 0;
             for (int t = 0; t < cols; t++)
             {
@@ -149,6 +157,7 @@ namespace DeepBrainInterface.Core
         public int ProcessFrameS16(short* data, int rows, int cols, int stepBytes, ulong* clocks, bool gate, RippleOut[] outBuf)
         {
             CheckRows(rows);
+            skipFrame = cols > 0 && Lagging(clocks[cols - 1]);
             int n = 0;
             for (int t = 0; t < cols; t++)
             {
@@ -168,6 +177,19 @@ namespace DeepBrainInterface.Core
                 if (cfg.Channels[c] < 0 || cfg.Channels[c] >= rows) throw new ArgumentException($"Channels[{c}] = {cfg.Channels[c]} is outside the frame's {rows} rows", "Channels");
         }
 
+        /// <summary>Stall guard. offset = wall time - hardware time of the frame's newest sample; the baseline is the smallest offset
+        /// seen, relaxed upward by 1000 ppm of the clock advance so crystal drift (tens of ppm) never accumulates into lag.
+        /// Lag = offset - baseline; above MaxLagMs the frame is a backlog frame.</summary>
+        bool Lagging(ulong clock)
+        {
+            if (maxLagTicks <= 0) return false;
+            double off = cfg.Timestamp() - clock * ticksPerClock;
+            if (!double.IsInfinity(baseOffset) && clock > lagClock) baseOffset += (clock - lagClock) * ticksPerClock * 1e-3;
+            lagClock = clock;
+            if (off < baseOffset) baseOffset = off;
+            return off - baseOffset > maxLagTicks;
+        }
+
         /// <summary>One kept sample of `phase` is in vec[phase]: run the chain, push the ring, and on phase 0 drive the stride counter.</summary>
         bool Step(int phase, ulong clock, bool gate, RippleOut[] outBuf, ref int n)
         {
@@ -180,6 +202,7 @@ namespace DeepBrainInterface.Core
             if (!rings[0].IsFull) return false;   // phase 0 sets the cadence; later phases join once their own ring is full
             if (++strideCounter < cfg.Stride) return false;
             strideCounter = 0;
+            if (skipFrame) { skippedCalls++; return false; }   // backlog after a stall: window stays current, no stale decision
             int am = activeModels; Combiner cb = combiner;       // live properties read once per inference
             long t0 = Stopwatch.GetTimestamp();
             Infer(am, cb);
@@ -190,7 +213,7 @@ namespace DeepBrainInterface.Core
             r.Prob0 = modelProbs[0]; r.Prob1 = nModels > 1 ? modelProbs[1] : float.NaN;
             r.DecisionIndex = decisionIndex++;
             r.ConfigVersion = decision.ConfigVersion + liveVersion;
-            r.InferenceUs = inferUs; r.StateResets = stateResets;
+            r.InferenceUs = inferUs; r.StateResets = stateResets; r.SkippedCalls = skippedCalls;
             if (snapshot != null && r.TTL && !lastTtl) { rings[0].CopyWindow(snapshot, 0); r.SnapshotWindow = snapshot; }
             lastTtl = r.TTL;
             outBuf[n++] = r;
