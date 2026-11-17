@@ -261,7 +261,7 @@
           <p2:HoldConsecutive>3</p2:HoldConsecutive>
           <p2:UseHardwareClock>false</p2:UseHardwareClock>
           <p2:HardwareClockHz>250000000</p2:HardwareClockHz>
-          <p2:MaxLagMs>2</p2:MaxLagMs>
+          <p2:MaxLagMs>0</p2:MaxLagMs>
           <p2:SnapshotEnabled>false</p2:SnapshotEnabled>
           <p2:ActiveModels>0</p2:ActiveModels>
           <p2:Combiner>First</p2:Combiner>
