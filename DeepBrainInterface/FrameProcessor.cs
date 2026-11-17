@@ -33,7 +33,7 @@ namespace DeepBrainInterface.Core
         ulong lastClock; long keptStep; int clockSeen;   // gap detection (streaming models only)
         int stateResets;
         readonly double ticksPerClock; readonly double maxLagTicks;   // stall guard (MaxLagMs)
-        double baseOffset = double.PositiveInfinity; ulong lagClock; bool skipFrame; int skippedCalls;
+        double baseOffset = double.PositiveInfinity; ulong lagClock, lagSince; bool skipFrame; int skippedCalls;
         static readonly double usPerTick = 1e6 / Stopwatch.Frequency;
 
         public FrameProcessor(ProcessorConfig config, IDecisionStage decisionStage)
@@ -178,16 +178,20 @@ namespace DeepBrainInterface.Core
         }
 
         /// <summary>Stall guard. offset = wall time - hardware time of the frame's newest sample; the baseline is the smallest offset
-        /// seen, relaxed upward by 1000 ppm of the clock advance so crystal drift (tens of ppm) never accumulates into lag.
-        /// Lag = offset - baseline; above MaxLagMs the frame is a backlog frame.</summary>
+        /// seen, relaxed upward by 1% of the clock advance, so clock drift (BadBunny ONIX vs PC: ~0.1%) never builds up into lag,
+        /// while a stall moves it by only 1% of its length. Lag = offset - baseline; above MaxLagMs the frame is a backlog frame.
+        /// If frames keep lagging for more than 1 s of hardware clock it is a lasting delivery delay, not a stall: re-anchor.</summary>
         bool Lagging(ulong clock)
         {
             if (maxLagTicks <= 0) return false;
             double off = cfg.Timestamp() - clock * ticksPerClock;
-            if (!double.IsInfinity(baseOffset) && clock > lagClock) baseOffset += (clock - lagClock) * ticksPerClock * 1e-3;
+            if (!double.IsInfinity(baseOffset) && clock > lagClock) baseOffset += (clock - lagClock) * ticksPerClock * 1e-2;
             lagClock = clock;
             if (off < baseOffset) baseOffset = off;
-            return off - baseOffset > maxLagTicks;
+            if (off - baseOffset <= maxLagTicks) { lagSince = 0; return false; }
+            if (lagSince == 0) lagSince = clock;
+            else if ((clock - lagSince) * ticksPerClock > Stopwatch.Frequency) { baseOffset = off; lagSince = 0; return false; }
+            return true;
         }
 
         /// <summary>One kept sample of `phase` is in vec[phase]: run the chain, push the ring, and on phase 0 drive the stride counter.</summary>
