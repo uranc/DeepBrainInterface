@@ -189,7 +189,7 @@
           <p2:GcLatencyMode>Interactive</p2:GcLatencyMode>
           <p2:DisablePowerThrottling>true</p2:DisablePowerThrottling>
           <p2:RestrictToPerformanceCores>false</p2:RestrictToPerformanceCores>
-          <p2:AffinityMaskHex>3C03</p2:AffinityMaskHex>
+          <p2:AffinityMaskHex>C03C0</p2:AffinityMaskHex>
         </Combinator>
       </Expression>
       <Expression xsi:type="Combinator">
@@ -261,6 +261,7 @@
           <p2:HoldConsecutive>3</p2:HoldConsecutive>
           <p2:UseHardwareClock>false</p2:UseHardwareClock>
           <p2:HardwareClockHz>250000000</p2:HardwareClockHz>
+          <p2:MaxLagMs>2</p2:MaxLagMs>
           <p2:SnapshotEnabled>false</p2:SnapshotEnabled>
           <p2:ActiveModels>0</p2:ActiveModels>
           <p2:Combiner>First</p2:Combiner>
@@ -333,7 +334,7 @@
         <io:Overwrite>false</io:Overwrite>
         <io:Suffix>FileCount</io:Suffix>
         <io:IncludeHeader>false</io:IncludeHeader>
-        <io:Selector>TTL,Score,EventCount,Probability,Clock,ConfigVersion,Prob0,Prob1,DecisionIndex</io:Selector>
+        <io:Selector>TTL,Score,EventCount,Probability,Clock,ConfigVersion,Prob0,Prob1,DecisionIndex,InferenceUs,StateResets,SkippedCalls</io:Selector>
       </Expression>
       <Expression xsi:type="scr:ExpressionTransform">
         <scr:Name>FsmParams</scr:Name>
